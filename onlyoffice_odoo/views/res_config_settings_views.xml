@@ -1,0 +1,120 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<!-- -->
+<!-- (c) Copyright Ascensio System SIA 2024 -->
+<!-- -->
+<odoo>
+  <record id="res_config_settings_view_form" model="ir.ui.view">
+    <field name="name">res.config.settings.view.form.inherit.onlyoffice_odoo</field>
+    <field name="model">res.config.settings</field>
+    <field name="priority" eval="10" />
+    <field name="inherit_id" ref="base.res_config_settings_view_form" />
+    <field name="arch" type="xml">
+      <xpath expr="//form" position="inside">
+        <app data-string="ONLYOFFICE" string="ONLYOFFICE" name="onlyoffice_odoo" groups="base.group_system">
+          <block title="About">
+            <setting
+              string="Welcome to ONLYOFFICE!"
+              help="This app enables creating, editing, and collaborating on fillable forms, office files, and attached documents in Odoo using ONLYOFFICE Docs."
+            >
+              <a
+                href="https://api.onlyoffice.com/docs/docs-api/get-started/ready-to-use-connectors/odoo-integration/"
+                target="_blank"
+              >
+                <i class="fa fa-arrow-right" /> Learn more </a>
+              <br />
+              <a
+                href="https://feedback.onlyoffice.com/forums/966080-your-voice-matters?category_id=519288"
+                target="_blank"
+              >
+                <i class="fa fa-arrow-right" /> Suggest a feature </a>
+            </setting>
+          </block>
+          <block title="General Settings" name="onlyoffice_odoo">
+            <setting string="ONLYOFFICE Docs address">
+              <field name="doc_server_public_url" />
+            </setting>
+            <br />
+            <setting string="Disable certificate verification">
+              <field name="doc_server_disable_certificate" />
+            </setting>
+            <br />
+            <setting string="ONLYOFFICE Docs secret key">
+              <field name="doc_server_jwt_secret" password="True" />
+            </setting>
+            <br />
+            <setting string="JWT Header">
+              <field name="doc_server_jwt_header" />
+            </setting>
+            <br />
+            <setting string="ONLYOFFICE Docs address for internal requests from the server">
+              <field name="doc_server_odoo_url" />
+            </setting>
+            <br />
+            <setting string="Server address for internal requests from ONLYOFFICE Docs">
+              <field name="doc_server_inner_url" />
+            </setting>
+            <br />
+            <div class="o_setting_box col-12 col-lg-6 o_searchable_setting">
+              <div class="o_setting_left_pane">
+                <field name="doc_server_demo" />
+              </div>
+              <div class="o_setting_right_pane">
+                <label class="o_form_label me-2" for="doc_server_demo">
+                  <span searchabletext="Connect to demo ONLYOFFICE Docs server">
+                    Connect to demo ONLYOFFICE Docs server
+                  </span>
+                </label>
+                <div class="o_widget o_widget_documentation_link d-inline">
+                  <a
+                    title="ONLYOFFICE Templates requires a properly licensed Document Server connected with Odoo. Contact sales at sales@onlyoffice.com to acquire the proper license."
+                    class="o_doc_link"
+                  >
+                    <i class="fa fa-question-circle" />
+                    <span />
+                  </a>
+                </div>
+                <div class="mt16">
+                  <div class="text-muted">
+                    <span
+                      searchabletext="This is a public test server, please do not use it for private sensitive data. The server will be available during a 30-day period."
+                    >
+                      This is a public test server, please do not use it for private sensitive data.
+                      The server will be available during a 30-day period.
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <br />
+            <setting>
+              <div class="onlyoffice_link_container">
+                <a
+                  class="onlyoffice_link_button"
+                  href="https://www.onlyoffice.com/docs-registration.aspx"
+                  target="_blank"
+                >
+                  GET NOW
+                </a>
+              </div>
+            </setting>
+          </block>
+          <block title="Other" name="onlyoffice_odoo" id="o_onlyoffice_settings_common">
+            <setting string="Open file in the same tab">
+              <field name="same_tab" />
+            </setting>
+          </block>
+        </app>
+      </xpath>
+    </field>
+  </record>
+
+  <record id="action_onlyoffice_config_settings" model="ir.actions.act_window">
+    <field name="name">Settings</field>
+    <field name="type">ir.actions.act_window</field>
+    <field name="res_model">res.config.settings</field>
+    <field name="view_id" ref="res_config_settings_view_form" />
+    <field name="view_mode">form</field>
+    <field name="target">current</field>
+    <field name="context">{'module' : 'onlyoffice_odoo'}</field>
+  </record>
+</odoo>
