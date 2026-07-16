@@ -44,7 +44,9 @@ class OnlyofficeDocuments_Connector(http.Controller):
                 "name": title + "." + supported_format,
                 "mimetype": file_utils.get_mime_by_ext(supported_format),
                 "raw": file_data,
-                "folder_id": int(folder_id),
+                # Documents uses user_folder_id for both real folder IDs and
+                # virtual roots such as MY and COMPANY.
+                "user_folder_id": str(folder_id),
             }
 
             document = request.env["documents.document"].create(data)
