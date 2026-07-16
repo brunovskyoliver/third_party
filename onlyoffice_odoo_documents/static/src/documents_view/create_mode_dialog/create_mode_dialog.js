@@ -62,7 +62,7 @@ export class CreateModeDialog extends Component {
       if (result.error) {
         this.notification.add(result.error, {
           sticky: false,
-          type: "error",
+          type: "danger",
         })
       } else {
         this.props.model.load()

@@ -61,7 +61,7 @@ export class CreateDialog extends Component {
     if (result.error) {
       this.notificationService.add(result.error, {
         sticky: false,
-        type: "error",
+        type: "danger",
       })
     } else {
       this.notificationService.add(_t("New document created in Documents"), {
