@@ -269,6 +269,25 @@ class TestCalendarEvent(TransactionCase, CaldavTestCommon):
         self.assertFalse(event.active)
         microsoft_delete.assert_not_called()
 
+    def test_microsoft_delete_log_only_mode(self):
+        user = self.user_1
+        parameter = self.env["ir.config_parameter"].sudo()
+        parameter.set_param("caldav_sync.microsoft_delete_mode", "log_only")
+        event = self._create_microsoft_event(user, "microsoft-log-only-event")
+
+        with patch.object(MicrosoftCalendarSync, "_microsoft_delete") as microsoft_delete:
+            with patch.object(
+                type(user), "_get_microsoft_sync_status", return_value="sync_active"
+            ):
+                with self.assertLogs(
+                    "odoo.addons.caldav_sync.models.calendar_event", level="WARNING"
+                ) as logs:
+                    event.write({"active": False})
+
+        self.assertFalse(event.active)
+        microsoft_delete.assert_not_called()
+        self.assertIn("temporary log-only mode", "\n".join(logs.output))
+
     def test_caldav_unlink_does_not_delete_from_microsoft(self):
         user = self.user_1
         event = self._create_microsoft_event(user, "microsoft-unlink-event")

@@ -3,6 +3,7 @@ import uuid
 import logging
 from .calendar_event import (
     _log_microsoft_request,
+    _microsoft_delete_block_reason,
     _microsoft_sync_is_blocked,
 )
 
@@ -43,8 +44,11 @@ class RecurrenceRule(models.Model):
         )
 
     def _microsoft_delete(self, user_id, event_id, timeout=None):
-        if _microsoft_sync_is_blocked(self):
-            _log_microsoft_request(self, "delete", event_id, blocked=True)
+        reason = _microsoft_delete_block_reason(self)
+        if reason:
+            _log_microsoft_request(
+                self, "delete", event_id, blocked=True, reason=reason
+            )
             return False
         _log_microsoft_request(self, "delete", event_id)
         if timeout is None:

@@ -19,6 +19,8 @@ _logger = logging.getLogger(__name__)
 
 CALDAV_SYNC_SOURCE = "caldav"
 NO_MICROSOFT_SYNC_CONTEXT = "no_microsoft_sync"
+MICROSOFT_DELETE_MODE_PARAM = "caldav_sync.microsoft_delete_mode"
+MICROSOFT_DELETE_MODE_LOG_ONLY = "log_only"
 CALDAV_IMPORT_CONTEXT = {
     "calendar_sync_source": CALDAV_SYNC_SOURCE,
     NO_MICROSOFT_SYNC_CONTEXT: True,
@@ -41,19 +43,34 @@ def _microsoft_sync_is_blocked(recordset):
     )
 
 
-def _log_microsoft_request(recordset, action, event_id=None, blocked=False):
+def _microsoft_delete_block_reason(recordset):
+    if _microsoft_sync_is_blocked(recordset):
+        return "source guard"
+    delete_mode = recordset.env["ir.config_parameter"].sudo().get_param(
+        MICROSOFT_DELETE_MODE_PARAM, "enabled"
+    )
+    if delete_mode.strip().lower() == MICROSOFT_DELETE_MODE_LOG_ONLY:
+        return "temporary log-only mode"
+    return None
+
+
+def _log_microsoft_request(
+    recordset, action, event_id=None, blocked=False, reason=None
+):
     message = (
-        "Blocked Microsoft Calendar %s for %s IDs %s (Microsoft event ID %s)"
+        "Blocked Microsoft Calendar %s for %s IDs %s (Microsoft event ID %s)%s"
         if blocked
-        else "Microsoft Calendar %s requested for %s IDs %s (Microsoft event ID %s)"
+        else "Microsoft Calendar %s requested for %s IDs %s (Microsoft event ID %s)%s"
     )
     log_method = _logger.warning if blocked else _logger.info
+    reason_suffix = " (%s)" % reason if reason else ""
     log_method(
         message,
         action,
         recordset._name,
         recordset.ids,
         event_id or "<new>",
+        reason_suffix,
     )
 
 WEEKDAY_MAP = {
@@ -269,8 +286,11 @@ class CalendarEvent(models.Model):
         )
 
     def _microsoft_delete(self, user_id, event_id, timeout=None):
-        if _microsoft_sync_is_blocked(self):
-            _log_microsoft_request(self, "delete", event_id, blocked=True)
+        reason = _microsoft_delete_block_reason(self)
+        if reason:
+            _log_microsoft_request(
+                self, "delete", event_id, blocked=True, reason=reason
+            )
             return False
         _log_microsoft_request(self, "delete", event_id)
         if timeout is None:
