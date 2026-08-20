@@ -17,6 +17,13 @@ import markdown2 as md2
 
 _logger = logging.getLogger(__name__)
 
+CALDAV_SYNC_SOURCE = "caldav"
+NO_MICROSOFT_SYNC_CONTEXT = "no_microsoft_sync"
+CALDAV_IMPORT_CONTEXT = {
+    "calendar_sync_source": CALDAV_SYNC_SOURCE,
+    NO_MICROSOFT_SYNC_CONTEXT: True,
+}
+
 if TYPE_CHECKING:
     from odoo.addons.base.models.res_users import Users as User
     from odoo.addons.base.models.res_partner import Partner
@@ -25,6 +32,29 @@ else:
     User = models.Model
     Partner = models.Model
     OdooCalendarEvent = models.Model
+
+
+def _microsoft_sync_is_blocked(recordset):
+    return bool(
+        recordset.env.context.get(NO_MICROSOFT_SYNC_CONTEXT)
+        or recordset.env.context.get("calendar_sync_source") == CALDAV_SYNC_SOURCE
+    )
+
+
+def _log_microsoft_request(recordset, action, event_id=None, blocked=False):
+    message = (
+        "Blocked Microsoft Calendar %s for %s IDs %s (Microsoft event ID %s)"
+        if blocked
+        else "Microsoft Calendar %s requested for %s IDs %s (Microsoft event ID %s)"
+    )
+    log_method = _logger.warning if blocked else _logger.info
+    log_method(
+        message,
+        action,
+        recordset._name,
+        recordset.ids,
+        event_id or "<new>",
+    )
 
 WEEKDAY_MAP = {
     0: "MO",
@@ -202,6 +232,8 @@ class CalendarEvent(models.Model):
     @api.model_create_multi
     def create(self, vals_list):
         ctx = {"caldav_no_sync": True}
+        if self.env.context.get(NO_MICROSOFT_SYNC_CONTEXT):
+            vals_list = [dict(vals, need_sync_m=False) for vals in vals_list]
         events = super(CalendarEvent, self.with_context(**ctx)).create(vals_list)
         # Microsoft imports use caldav_no_sync to prevent a synchronous CalDAV
         # write. They are not CalDAV events, so do not assign them a synthetic
@@ -215,6 +247,35 @@ class CalendarEvent(models.Model):
         if not self.env.context.get("caldav_no_sync"):
             events._to_sync()._sync_create_to_caldav()
         return events
+
+    def _microsoft_insert(self, values, timeout=None):
+        if _microsoft_sync_is_blocked(self):
+            _log_microsoft_request(self, "insert", blocked=True)
+            return False
+        _log_microsoft_request(self, "insert")
+        if timeout is None:
+            return super()._microsoft_insert(values)
+        return super()._microsoft_insert(values, timeout=timeout)
+
+    def _microsoft_patch(self, user_id, event_id, values, timeout=None):
+        if _microsoft_sync_is_blocked(self):
+            _log_microsoft_request(self, "patch", event_id, blocked=True)
+            return False
+        _log_microsoft_request(self, "patch", event_id)
+        if timeout is None:
+            return super()._microsoft_patch(user_id, event_id, values)
+        return super()._microsoft_patch(
+            user_id, event_id, values, timeout=timeout
+        )
+
+    def _microsoft_delete(self, user_id, event_id, timeout=None):
+        if _microsoft_sync_is_blocked(self):
+            _log_microsoft_request(self, "delete", event_id, blocked=True)
+            return False
+        _log_microsoft_request(self, "delete", event_id)
+        if timeout is None:
+            return super()._microsoft_delete(user_id, event_id)
+        return super()._microsoft_delete(user_id, event_id, timeout=timeout)
 
     def _sync_create_to_caldav(self):
         for event in self:
@@ -236,6 +297,9 @@ class CalendarEvent(models.Model):
                     )
 
     def write(self, vals):
+        vals = dict(vals)
+        if self.env.context.get(NO_MICROSOFT_SYNC_CONTEXT):
+            vals["need_sync_m"] = False
         res = super(CalendarEvent, self.with_context(caldav_no_sync=True)).write(vals)
         # Events sometimes get archived in Odoo in the process of updating recurrence
         # In that case, we will delete them from the CalDAV server before recreating
@@ -470,8 +534,27 @@ class CalendarEvent(models.Model):
         return self.filtered(
             lambda event: event.id
             and event._is_caldav_enabled()
+            and not event._is_microsoft_owned()
             and (event.is_base_event or event.differs_from_base_event)
         )
+
+    def _is_microsoft_owned(self):
+        self.ensure_one()
+        return any(
+            (
+                self.microsoft_id,
+                self.ms_universal_event_id,
+                self.microsoft_recurrence_master_id,
+            )
+        )
+
+    @api.model
+    def _caldav_owned_event_domain(self):
+        return [
+            ("microsoft_id", "=", False),
+            ("ms_universal_event_id", "=", False),
+            ("microsoft_recurrence_master_id", "=", False),
+        ]
 
     def _create_in_icalendar(self, calendar: caldav.Calendar) -> List[caldav.Event]:
         """Create an event matching self in the provided calendar.
@@ -688,13 +771,7 @@ class CalendarEvent(models.Model):
                 ("caldav_uid", "!=", False),
                 ("id", "not " "in", synced_events.ids),
                 ("user_id", "=", user.id),
-                # Microsoft owns these records. They may have a CalDAV UID
-                # left over from an older version of this bridge, but their
-                # absence from CalDAV is not permission to delete them.
-                ("microsoft_id", "=", False),
-                ("ms_universal_event_id", "=", False),
-                ("microsoft_recurrence_master_id", "=", False),
-            ]
+            ] + self._caldav_owned_event_domain()
         )
         orphaned_events = orphaned_events._to_sync()
         if orphaned_events:
@@ -710,13 +787,14 @@ class CalendarEvent(models.Model):
                 except NotFoundError:
                     # There are no more events with this UID, so we need to clear
                     # out the whole recurrence chain from the Odoo side.
-                    ctx = {"caldav_no_sync": True}
+                    ctx = {**CALDAV_IMPORT_CONTEXT, "caldav_no_sync": True}
                     recurrence = base_orphan.recurrence_id
                     recurrence.calendar_event_ids.with_context(**ctx).with_user(
                         user
                     ).unlink()
                     recurrence.with_context(**ctx).with_user(user).unlink()
             (orphaned_events - base_orphans).with_context(
+                **CALDAV_IMPORT_CONTEXT,
                 caldav_no_sync=True
             ).with_user(user).unlink()
 
@@ -743,6 +821,41 @@ class CalendarEvent(models.Model):
             )
 
             existing_instance = self._get_existing_instance(uid, recurrence_id)
+            known_recurrence = self.env["calendar.recurrence"].with_context(
+                active_test=False
+            ).search([("caldav_uid", "=", uid)], limit=1)
+            microsoft_events = self.env["calendar.event"].with_context(
+                active_test=False
+            ).search([("caldav_uid", "=", uid)]).filtered(
+                lambda event: event._is_microsoft_owned()
+            )
+            recurrence_is_microsoft_owned = known_recurrence and (
+                known_recurrence.microsoft_id
+                or known_recurrence.ms_universal_event_id
+                or known_recurrence.calendar_event_ids.filtered(
+                    lambda event: event._is_microsoft_owned()
+                )
+            )
+            if not existing_instance and (
+                microsoft_events or recurrence_is_microsoft_owned
+            ):
+                _logger.warning(
+                    "Ignoring CalDAV event %s because its UID belongs to "
+                    "a Microsoft-owned event",
+                    uid,
+                )
+                continue
+            if not existing_instance and known_recurrence:
+                # The recurrence UID is authoritative even when an older
+                # record lost its base-event UID. Reuse the existing series so
+                # this snapshot cannot create a duplicate recurrence.
+                synced_events |= known_recurrence.calendar_event_ids
+                _logger.warning(
+                    "Reusing existing CalDAV recurrence %s instead of "
+                    "creating a duplicate",
+                    uid,
+                )
+                continue
             outdated = self._get_outdated(component, existing_instance, synced_events)
             owned = (
                 existing_instance and existing_instance.partner_id == user.partner_id
@@ -758,7 +871,9 @@ class CalendarEvent(models.Model):
                     recurrency_vals = {}
 
                 new_event = self.with_context(
-                    caldav_no_sync=True, caldav_keep_ids=True
+                    **CALDAV_IMPORT_CONTEXT,
+                    caldav_no_sync=True,
+                    caldav_keep_ids=True,
                 ).create(values | recurrency_vals)
                 self.env["calendar.event"].flush_model()
                 if new_event.recurrency:
@@ -774,6 +889,7 @@ class CalendarEvent(models.Model):
                 ) | existing_instance._get_value_changes(values)
                 if changed_vals:
                     existing_instance.with_context(
+                        **CALDAV_IMPORT_CONTEXT,
                         caldav_no_sync=True,
                         caldav_keep_ids=True,
                     ).write(changed_vals)
@@ -789,33 +905,52 @@ class CalendarEvent(models.Model):
         """Find the Odoo calendar.event record matching uid and,
         if set, recurrence_id.
         """
+        owned_domain = self._caldav_owned_event_domain()
         if recurrence_id:
-            recurrence_id = recurrence_id.astimezone(utc).replace(tzinfo=None)
+            if isinstance(recurrence_id, datetime):
+                if recurrence_id.tzinfo:
+                    recurrence_id = recurrence_id.astimezone(utc).replace(
+                        tzinfo=None
+                    )
+                else:
+                    recurrence_id = utc.localize(recurrence_id).replace(
+                        tzinfo=None
+                    )
+            else:
+                recurrence_id = datetime.combine(recurrence_id, time.min)
             instance = self.env["calendar.event"].search(
                 [
                     ("caldav_uid", "=", uid),
                     ("caldav_recurrence_id", "=", recurrence_id),
-                ]
+                ] + owned_domain
             )
         else:
             instance = self.env["calendar.event"].search(
                 [
                     ("caldav_uid", "=", uid),
                     ("recurrency", "=", False),
-                ]
+                ] + owned_domain
             )
             if instance:
                 return instance
             else:
-                return (
-                    self.env["calendar.recurrence"]
-                    .search(
-                        [
-                            ("base_event_id.caldav_uid", "=", uid),
-                        ]
-                    )
-                    .base_event_id
+                recurrence = self.env["calendar.recurrence"].search(
+                    [("base_event_id.caldav_uid", "=", uid)], limit=1
                 )
+                if not recurrence:
+                    recurrence = self.env["calendar.recurrence"].search(
+                        [("caldav_uid", "=", uid)], limit=1
+                    )
+                if (
+                    recurrence
+                    and recurrence.base_event_id
+                    and not recurrence.microsoft_id
+                    and not recurrence.ms_universal_event_id
+                    and not recurrence.calendar_event_ids.filtered(
+                        lambda event: event._is_microsoft_owned()
+                    )
+                ):
+                    return recurrence.base_event_id
 
         if len(instance) == 1:
             return instance
@@ -826,7 +961,7 @@ class CalendarEvent(models.Model):
             [
                 ("caldav_uid", "=", uid),
                 ("recurrence_id", "=", False),
-            ]
+            ] + owned_domain
         )
 
     @api.model

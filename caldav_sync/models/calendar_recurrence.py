@@ -1,6 +1,10 @@
 from odoo import models, fields, api
 import uuid
 import logging
+from .calendar_event import (
+    _log_microsoft_request,
+    _microsoft_sync_is_blocked,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -17,8 +21,40 @@ class RecurrenceRule(models.Model):
         'UNIQUE (caldav_uid)',
         "The caldav_uid must be unique.",
     )
+
+    def _microsoft_insert(self, values, timeout=None):
+        if _microsoft_sync_is_blocked(self):
+            _log_microsoft_request(self, "insert", blocked=True)
+            return False
+        _log_microsoft_request(self, "insert")
+        if timeout is None:
+            return super()._microsoft_insert(values)
+        return super()._microsoft_insert(values, timeout=timeout)
+
+    def _microsoft_patch(self, user_id, event_id, values, timeout=None):
+        if _microsoft_sync_is_blocked(self):
+            _log_microsoft_request(self, "patch", event_id, blocked=True)
+            return False
+        _log_microsoft_request(self, "patch", event_id)
+        if timeout is None:
+            return super()._microsoft_patch(user_id, event_id, values)
+        return super()._microsoft_patch(
+            user_id, event_id, values, timeout=timeout
+        )
+
+    def _microsoft_delete(self, user_id, event_id, timeout=None):
+        if _microsoft_sync_is_blocked(self):
+            _log_microsoft_request(self, "delete", event_id, blocked=True)
+            return False
+        _log_microsoft_request(self, "delete", event_id)
+        if timeout is None:
+            return super()._microsoft_delete(user_id, event_id)
+        return super()._microsoft_delete(user_id, event_id, timeout=timeout)
+
     @api.model_create_multi
     def create(self, vals_list):
+        if self.env.context.get("no_microsoft_sync"):
+            vals_list = [dict(vals, need_sync_m=False) for vals in vals_list]
         if not self._context.get("caldav_keep_ids"):
             for vals in vals_list:
                 vals["caldav_uid"] = str(uuid.uuid4())

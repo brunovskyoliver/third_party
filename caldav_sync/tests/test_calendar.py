@@ -8,6 +8,7 @@ from .common import CaldavTestCommon
 from contextlib import contextmanager
 from datetime import date, datetime, UTC, timedelta
 import caldav
+from odoo.addons.microsoft_calendar.models.microsoft_sync import MicrosoftCalendarSync
 
 WEEKDAY_MAP = {
     0: "SUN",
@@ -197,28 +198,92 @@ class TestCalendarEvent(TransactionCase, CaldavTestCommon):
 
     def test_microsoft_event_is_not_removed_by_caldav_orphan_cleanup(self):
         user = self.user_1
-        event = (
-            self.env["calendar.event"]
-            .with_user(user)
-            .with_context(caldav_no_sync=True, caldav_keep_ids=True)
-            .create(
-                {
-                    "name": "Microsoft event",
-                    "user_id": user.id,
-                    "caldav_uid": "microsoft-event-uid",
-                    "microsoft_id": "microsoft-event-id",
-                    "ms_universal_event_id": "microsoft-universal-id",
-                    "microsoft_recurrence_master_id": "microsoft-master-id",
-                    "start": datetime.now() + timedelta(days=2),
-                    "stop": datetime.now() + timedelta(days=2, hours=1),
-                }
-            )
-        )
+        event = self._create_microsoft_event(user, "microsoft-event-uid")
 
         with _patch_caldav_with_events_from_ics(None, user):
             self.env["calendar.event"].poll_caldav_server()
 
         self.assertTrue(event.exists())
+
+    def test_caldav_import_does_not_insert_to_microsoft(self):
+        user = self.user_1
+        with patch.object(MicrosoftCalendarSync, "_microsoft_insert") as microsoft_insert:
+            with patch.object(
+                type(user), "_get_microsoft_sync_status", return_value="sync_active"
+            ):
+                event = (
+                    self.env["calendar.event"]
+                    .with_user(user)
+                    .with_context(
+                        caldav_no_sync=True,
+                        caldav_keep_ids=True,
+                        calendar_sync_source="caldav",
+                        no_microsoft_sync=True,
+                    )
+                    .create(
+                        {
+                            "name": "CalDAV event",
+                            "user_id": user.id,
+                            "caldav_uid": "caldav-created-event",
+                            "need_sync_m": True,
+                            "start": datetime.now() + timedelta(days=2),
+                            "stop": datetime.now() + timedelta(days=2, hours=1),
+                        }
+                    )
+                )
+
+        self.assertTrue(event.exists())
+        self.assertFalse(event.need_sync_m)
+        microsoft_insert.assert_not_called()
+
+    def test_caldav_write_does_not_patch_microsoft(self):
+        user = self.user_1
+        event = self._create_microsoft_event(user, "microsoft-patch-event")
+        with patch.object(MicrosoftCalendarSync, "_microsoft_patch") as microsoft_patch:
+            with patch.object(
+                type(user), "_get_microsoft_sync_status", return_value="sync_active"
+            ):
+                event.with_context(
+                    caldav_no_sync=True,
+                    calendar_sync_source="caldav",
+                    no_microsoft_sync=True,
+                ).write({"name": "Changed by CalDAV"})
+
+        self.assertEqual(event.name, "Changed by CalDAV")
+        self.assertFalse(event.need_sync_m)
+        microsoft_patch.assert_not_called()
+
+    def test_caldav_archive_does_not_delete_from_microsoft(self):
+        user = self.user_1
+        event = self._create_microsoft_event(user, "microsoft-archive-event")
+        with patch.object(MicrosoftCalendarSync, "_microsoft_delete") as microsoft_delete:
+            with patch.object(
+                type(user), "_get_microsoft_sync_status", return_value="sync_active"
+            ):
+                event.with_context(
+                    caldav_no_sync=True,
+                    calendar_sync_source="caldav",
+                    no_microsoft_sync=True,
+                ).write({"active": False})
+
+        self.assertFalse(event.active)
+        microsoft_delete.assert_not_called()
+
+    def test_caldav_unlink_does_not_delete_from_microsoft(self):
+        user = self.user_1
+        event = self._create_microsoft_event(user, "microsoft-unlink-event")
+        with patch.object(MicrosoftCalendarSync, "_microsoft_delete") as microsoft_delete:
+            with patch.object(
+                type(user), "_get_microsoft_sync_status", return_value="sync_active"
+            ):
+                event.with_context(
+                    caldav_no_sync=True,
+                    calendar_sync_source="caldav",
+                    no_microsoft_sync=True,
+                ).unlink()
+
+        self.assertFalse(event.exists())
+        microsoft_delete.assert_not_called()
 
     def test_microsoft_import_does_not_get_a_caldav_uid(self):
         user = self.user_1
@@ -239,6 +304,25 @@ class TestCalendarEvent(TransactionCase, CaldavTestCommon):
         )
 
         self.assertFalse(event.caldav_uid)
+
+    def test_caldav_does_not_update_legacy_microsoft_uid(self):
+        user = self.user_1
+        event = self._create_microsoft_event(
+            user, "5C753EFA-DA9C-479A-81CE-5A5421518EAE"
+        )
+
+        with _patch_caldav_with_events_from_ics(_get_ics_path("basic.ics"), user):
+            self.env["calendar.event"].poll_caldav_server()
+
+        self.assertEqual(event.name, "Microsoft event")
+        self.assertEqual(
+            len(
+                self.env["calendar.event"].search(
+                    [("caldav_uid", "=", event.caldav_uid)]
+                )
+            ),
+            1,
+        )
 
     def test_caldav_orphan_cleanup_skips_incomplete_snapshot(self):
         user = self.user_1
@@ -267,6 +351,39 @@ class TestCalendarEvent(TransactionCase, CaldavTestCommon):
             self.env["calendar.event"]._poll_user_caldav_server(user)
 
         self.assertTrue(event.exists())
+
+    def test_existing_recurrence_uid_is_reused_after_base_uid_drift(self):
+        user = self.user_1
+        ics_path = _get_ics_path("test_recurring.ics")
+        with _patch_caldav_with_events_from_ics(ics_path, user):
+            self.env["calendar.event"].poll_caldav_server()
+
+        uid = "F777C16F-2F14-4326-9681-69C6043DB8C0"
+        recurrence = self.env["calendar.recurrence"].search(
+            [("caldav_uid", "=", uid)], limit=1
+        )
+        self.assertTrue(recurrence)
+        recurrence.base_event_id.with_context(caldav_no_sync=True).write(
+            {"caldav_uid": False}
+        )
+
+        with self.assertLogs(
+            "odoo.addons.caldav_sync.models.calendar_event", level="INFO"
+        ) as logs:
+            with _patch_caldav_with_events_from_ics(ics_path, user):
+                self.env["calendar.event"].poll_caldav_server()
+
+        log_output = "\n".join(logs.output)
+        self.assertNotIn("calendar_recurrence_caldav_uid_unique", log_output)
+        self.assertNotIn("orphan cleanup will be skipped", log_output)
+        self.assertEqual(
+            len(
+                self.env["calendar.recurrence"].search(
+                    [("caldav_uid", "=", uid)]
+                )
+            ),
+            1,
+        )
 
     def test_matches_caldav_start_accepts_date_only_event(self):
         user = self.user_1
@@ -502,3 +619,23 @@ class TestCalendarEvent(TransactionCase, CaldavTestCommon):
             mock_calendar.events.return_value = []
             mock_calendar.event_by_uid.return_value = mock_event_by_uid
             yield mock_client, mock_calendar
+
+    def _create_microsoft_event(self, user, caldav_uid):
+        return (
+            self.env["calendar.event"]
+            .with_user(user)
+            .with_context(caldav_no_sync=True, caldav_keep_ids=True)
+            .create(
+                {
+                    "name": "Microsoft event",
+                    "user_id": user.id,
+                    "caldav_uid": caldav_uid,
+                    "microsoft_id": "microsoft-event-id",
+                    "ms_universal_event_id": "microsoft-universal-id",
+                    "microsoft_recurrence_master_id": "microsoft-master-id",
+                    "need_sync_m": True,
+                    "start": datetime.now() + timedelta(days=2),
+                    "stop": datetime.now() + timedelta(days=2, hours=1),
+                }
+            )
+        )

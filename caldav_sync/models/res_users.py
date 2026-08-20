@@ -46,7 +46,13 @@ class ResUsers(models.Model):
             )
             return False
 
-        return super(ResUsers, self.with_context(caldav_no_sync=True))._sync_microsoft_calendar()
+        return super(
+            ResUsers,
+            self.with_context(
+                caldav_no_sync=True,
+                calendar_sync_source="microsoft",
+            ),
+        )._sync_microsoft_calendar()
 
     @api.constrains("caldav_calendar_url")
     def _check_caldav_calendar_url(self):
