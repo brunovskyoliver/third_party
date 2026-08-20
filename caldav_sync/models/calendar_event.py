@@ -21,6 +21,8 @@ CALDAV_SYNC_SOURCE = "caldav"
 NO_MICROSOFT_SYNC_CONTEXT = "no_microsoft_sync"
 MICROSOFT_DELETE_MODE_PARAM = "caldav_sync.microsoft_delete_mode"
 MICROSOFT_DELETE_MODE_LOG_ONLY = "log_only"
+MICROSOFT_SYNC_DIRECTION_PARAM = "caldav_sync.microsoft_sync_direction"
+MICROSOFT_SYNC_DIRECTION_IMPORT_ONLY = "import_only"
 CALDAV_IMPORT_CONTEXT = {
     "calendar_sync_source": CALDAV_SYNC_SOURCE,
     NO_MICROSOFT_SYNC_CONTEXT: True,
@@ -40,6 +42,16 @@ def _microsoft_sync_is_blocked(recordset):
     return bool(
         recordset.env.context.get(NO_MICROSOFT_SYNC_CONTEXT)
         or recordset.env.context.get("calendar_sync_source") == CALDAV_SYNC_SOURCE
+    )
+
+
+def _microsoft_outbound_is_blocked(recordset):
+    return (
+        recordset.env.context.get("microsoft_import_only")
+        or recordset.env["ir.config_parameter"].sudo().get_param(
+            MICROSOFT_SYNC_DIRECTION_PARAM, "bidirectional"
+        ).strip().lower()
+        == MICROSOFT_SYNC_DIRECTION_IMPORT_ONLY
     )
 
 
@@ -249,7 +261,9 @@ class CalendarEvent(models.Model):
     @api.model_create_multi
     def create(self, vals_list):
         ctx = {"caldav_no_sync": True}
-        if self.env.context.get(NO_MICROSOFT_SYNC_CONTEXT):
+        if self.env.context.get(NO_MICROSOFT_SYNC_CONTEXT) or _microsoft_outbound_is_blocked(
+            self
+        ):
             vals_list = [dict(vals, need_sync_m=False) for vals in vals_list]
         events = super(CalendarEvent, self.with_context(**ctx)).create(vals_list)
         # Microsoft imports use caldav_no_sync to prevent a synchronous CalDAV
@@ -266,8 +280,13 @@ class CalendarEvent(models.Model):
         return events
 
     def _microsoft_insert(self, values, timeout=None):
-        if _microsoft_sync_is_blocked(self):
-            _log_microsoft_request(self, "insert", blocked=True)
+        if _microsoft_sync_is_blocked(self) or _microsoft_outbound_is_blocked(self):
+            reason = (
+                "source guard"
+                if _microsoft_sync_is_blocked(self)
+                else "import-only mode"
+            )
+            _log_microsoft_request(self, "insert", blocked=True, reason=reason)
             return False
         _log_microsoft_request(self, "insert")
         if timeout is None:
@@ -275,8 +294,13 @@ class CalendarEvent(models.Model):
         return super()._microsoft_insert(values, timeout=timeout)
 
     def _microsoft_patch(self, user_id, event_id, values, timeout=None):
-        if _microsoft_sync_is_blocked(self):
-            _log_microsoft_request(self, "patch", event_id, blocked=True)
+        if _microsoft_sync_is_blocked(self) or _microsoft_outbound_is_blocked(self):
+            reason = (
+                "source guard"
+                if _microsoft_sync_is_blocked(self)
+                else "import-only mode"
+            )
+            _log_microsoft_request(self, "patch", event_id, blocked=True, reason=reason)
             return False
         _log_microsoft_request(self, "patch", event_id)
         if timeout is None:
@@ -287,6 +311,8 @@ class CalendarEvent(models.Model):
 
     def _microsoft_delete(self, user_id, event_id, timeout=None):
         reason = _microsoft_delete_block_reason(self)
+        if not reason and _microsoft_outbound_is_blocked(self):
+            reason = "import-only mode"
         if reason:
             _log_microsoft_request(
                 self, "delete", event_id, blocked=True, reason=reason
@@ -296,6 +322,11 @@ class CalendarEvent(models.Model):
         if timeout is None:
             return super()._microsoft_delete(user_id, event_id)
         return super()._microsoft_delete(user_id, event_id, timeout=timeout)
+
+    def _sync_odoo2microsoft(self):
+        if _microsoft_outbound_is_blocked(self):
+            return self
+        return super()._sync_odoo2microsoft()
 
     def _sync_create_to_caldav(self):
         for event in self:
@@ -318,7 +349,9 @@ class CalendarEvent(models.Model):
 
     def write(self, vals):
         vals = dict(vals)
-        if self.env.context.get(NO_MICROSOFT_SYNC_CONTEXT):
+        if self.env.context.get(NO_MICROSOFT_SYNC_CONTEXT) or _microsoft_outbound_is_blocked(
+            self
+        ):
             vals["need_sync_m"] = False
         res = super(CalendarEvent, self.with_context(caldav_no_sync=True)).write(vals)
         # Events sometimes get archived in Odoo in the process of updating recurrence

@@ -4,6 +4,7 @@ import logging
 from .calendar_event import (
     _log_microsoft_request,
     _microsoft_delete_block_reason,
+    _microsoft_outbound_is_blocked,
     _microsoft_sync_is_blocked,
 )
 
@@ -24,8 +25,13 @@ class RecurrenceRule(models.Model):
     )
 
     def _microsoft_insert(self, values, timeout=None):
-        if _microsoft_sync_is_blocked(self):
-            _log_microsoft_request(self, "insert", blocked=True)
+        if _microsoft_sync_is_blocked(self) or _microsoft_outbound_is_blocked(self):
+            reason = (
+                "source guard"
+                if _microsoft_sync_is_blocked(self)
+                else "import-only mode"
+            )
+            _log_microsoft_request(self, "insert", blocked=True, reason=reason)
             return False
         _log_microsoft_request(self, "insert")
         if timeout is None:
@@ -33,8 +39,13 @@ class RecurrenceRule(models.Model):
         return super()._microsoft_insert(values, timeout=timeout)
 
     def _microsoft_patch(self, user_id, event_id, values, timeout=None):
-        if _microsoft_sync_is_blocked(self):
-            _log_microsoft_request(self, "patch", event_id, blocked=True)
+        if _microsoft_sync_is_blocked(self) or _microsoft_outbound_is_blocked(self):
+            reason = (
+                "source guard"
+                if _microsoft_sync_is_blocked(self)
+                else "import-only mode"
+            )
+            _log_microsoft_request(self, "patch", event_id, blocked=True, reason=reason)
             return False
         _log_microsoft_request(self, "patch", event_id)
         if timeout is None:
@@ -45,6 +56,8 @@ class RecurrenceRule(models.Model):
 
     def _microsoft_delete(self, user_id, event_id, timeout=None):
         reason = _microsoft_delete_block_reason(self)
+        if not reason and _microsoft_outbound_is_blocked(self):
+            reason = "import-only mode"
         if reason:
             _log_microsoft_request(
                 self, "delete", event_id, blocked=True, reason=reason
@@ -55,9 +68,21 @@ class RecurrenceRule(models.Model):
             return super()._microsoft_delete(user_id, event_id)
         return super()._microsoft_delete(user_id, event_id, timeout=timeout)
 
+    def write(self, vals):
+        if _microsoft_outbound_is_blocked(self):
+            vals = dict(vals, need_sync_m=False)
+        return super().write(vals)
+
+    def _sync_odoo2microsoft(self):
+        if _microsoft_outbound_is_blocked(self):
+            return self
+        return super()._sync_odoo2microsoft()
+
     @api.model_create_multi
     def create(self, vals_list):
-        if self.env.context.get("no_microsoft_sync"):
+        if self.env.context.get("no_microsoft_sync") or _microsoft_outbound_is_blocked(
+            self
+        ):
             vals_list = [dict(vals, need_sync_m=False) for vals in vals_list]
         if not self._context.get("caldav_keep_ids"):
             for vals in vals_list:

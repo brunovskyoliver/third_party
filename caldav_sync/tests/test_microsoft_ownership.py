@@ -118,3 +118,29 @@ class TestMicrosoftImportOwnership(TransactionCase, CaldavTestCommon):
                 ]
             )
         )
+
+    def test_import_only_mode_blocks_all_odoo_to_microsoft_requests(self):
+        self.env["ir.config_parameter"].sudo().set_param(
+            "caldav_sync.microsoft_sync_direction", "import_only"
+        )
+        event = self.env["calendar.event"].with_user(self.sync_user).create(
+            {
+                "name": "Import-only event",
+                "user_id": self.sync_user.id,
+                "start": fields.Datetime.now() + timedelta(days=1),
+                "stop": fields.Datetime.now() + timedelta(days=1, hours=1),
+                "microsoft_id": "existing-microsoft-id",
+            }
+        )
+
+        with patch.object(MicrosoftCalendarService, "insert") as insert, patch.object(
+            MicrosoftCalendarService, "patch"
+        ) as patch_event, patch.object(MicrosoftCalendarService, "delete") as delete:
+            event._sync_odoo2microsoft()
+            event.write({"name": "Changed locally"})
+            event._microsoft_delete(self.sync_user, event.microsoft_id)
+
+        self.assertFalse(event.need_sync_m)
+        insert.assert_not_called()
+        patch_event.assert_not_called()
+        delete.assert_not_called()
