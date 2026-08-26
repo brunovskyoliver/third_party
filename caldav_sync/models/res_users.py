@@ -46,13 +46,14 @@ class ResUsers(models.Model):
             )
             return False
 
-        return super(
-            ResUsers,
-            self.with_context(
-                caldav_no_sync=True,
-                calendar_sync_source="microsoft",
-            ),
-        )._sync_microsoft_calendar()
+        # Cron callers may provide a superuser environment; Microsoft import
+        # semantics must follow this record's account, not env.uid.
+        sync_env = self.env(user=self.id, su=True)
+        sync_user = self.with_env(sync_env).with_context(
+            caldav_no_sync=True,
+            calendar_sync_source="microsoft",
+        )
+        return super(ResUsers, sync_user)._sync_microsoft_calendar()
 
     @api.constrains("caldav_calendar_url")
     def _check_caldav_calendar_url(self):
