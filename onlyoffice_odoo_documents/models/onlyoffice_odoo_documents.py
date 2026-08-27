@@ -12,7 +12,8 @@ class OnlyofficeDocuments(models.Model):
         if not document_id:
             raise AccessError(_("No document selected for sharing."))
 
-        is_admin = self.env.user.has_group("base.group_system")
+        # Internal synchronizers use sudo() while preserving the actor in env.user.
+        is_admin = self.env.is_superuser() or self.env.user.has_group("base.group_system")
         document = self.env["documents.document"].browse(document_id)
         if not is_admin and document.create_uid != self.env.user:
             raise AccessError(_("Only the owner or administrator can share documents."))
