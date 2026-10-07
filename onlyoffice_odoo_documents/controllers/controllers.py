@@ -44,8 +44,9 @@ class OnlyofficeDocuments_Connector(http.Controller):
                 "name": title + "." + supported_format,
                 "mimetype": file_utils.get_mime_by_ext(supported_format),
                 "raw": file_data,
-                # Documents uses user_folder_id for both real folder IDs and
-                # virtual roots such as MY and COMPANY.
+                # Documents uses user_folder_id for both actual folder IDs and
+                # virtual roots such as "MY" (My Drive) and "COMPANY".
+                # Casting here prevents creating files from the My Drive view.
                 "user_folder_id": str(folder_id),
             }
 
