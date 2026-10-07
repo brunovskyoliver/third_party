@@ -1,19 +1,21 @@
-from odoo.tests import TransactionCase
+from odoo.tests import TransactionCase, tagged
 from unittest.mock import patch, MagicMock
 from .common import CaldavTestCommon
 from .test_calendar import _get_ics_path, _patch_caldav_with_events_from_ics
 
 
+@tagged("post_install", "-at_install")
 class TestExternalOrganizer(TransactionCase, CaldavTestCommon):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.user = cls._generate_user(
-            "test",
-            caldav_username="test",
-            caldav_password="test",
-            caldav_url="https://example.com/calendar",
-        )
+        with patch("caldav.DAVClient"):
+            cls.user = cls._generate_user(
+                "test",
+                caldav_username="test",
+                caldav_password="test",
+                caldav_url="https://calendar.example.test/calendar",
+            )
 
     def test_external_organizer_event_sync(self):
         """Unknown external organizers must not become Odoo contacts."""

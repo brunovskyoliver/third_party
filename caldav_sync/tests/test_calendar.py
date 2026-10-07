@@ -130,6 +130,11 @@ class TestCalendarEvent(TransactionCase, CaldavTestCommon):
             caldav_password="pass3",
             caldav_url=cls.user_3_url,
         )
+        # Imported invitees must already exist; the bridge does not create contacts.
+        cls.env["res.partner"].create([
+            {"name": "Synthetic partner 1", "email": "partner1@example.com"},
+            {"name": "Synthetic partner 2", "email": "partner2@example.com"},
+        ])
 
     def test_basic_event_from_server_create(self):
         user = self.user_1
@@ -363,7 +368,7 @@ class TestCalendarEvent(TransactionCase, CaldavTestCommon):
         with patch("caldav.DAVClient") as MockDAVClient:
             mock_calendar = MagicMock()
             mock_calendar.events.return_value = [
-                MagicMock(icalendar_instance=object())
+                MagicMock(data="synthetic-invalid-event", url=None, icalendar_instance=object())
             ]
             MockDAVClient.return_value.calendar.return_value = mock_calendar
             user._compute_is_caldav_enabled()
@@ -511,7 +516,7 @@ class TestCalendarEvent(TransactionCase, CaldavTestCommon):
             self.env["calendar.event"].poll_caldav_server()
         with _patch_caldav_with_events_from_ics(ics_path, user3):
             self.env["calendar.event"].poll_caldav_server()
-        notification_method = "odoo.addons.calendar.models.calendar_attendee.Attendee._send_mail_to_attendees"
+        notification_method = "odoo.addons.calendar.models.calendar_attendee.CalendarAttendee._notify_attendees"
         # Now update it to remove one attendee
         # Shuffle the user polling order just to test more robustly
         ics_path = _get_ics_path("test_multi_user_update.ics")

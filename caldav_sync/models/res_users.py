@@ -154,6 +154,7 @@ class ResUsers(models.Model):
             url=self.caldav_calendar_url,
             username=self.caldav_username,
             password=self.caldav_password,
+            timeout=30,
         )
 
     def _get_caldav_events(self):

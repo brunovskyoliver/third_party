@@ -1,11 +1,16 @@
 import uuid
+import hashlib
+import json
 
 import icalendar.cal
 
 from odoo import models, api, fields, _
 from odoo.addons.calendar.models.calendar_recurrence import MAX_RECURRENT_EVENT
 import caldav
-from caldav.lib.error import NotFoundError
+from caldav.lib.error import DAVError, NotFoundError
+from caldav.elements import dav
+from psycopg2.extensions import TransactionRollbackError
+from requests.exceptions import RequestException
 import logging
 from datetime import date, datetime, time
 from icalendar import vCalAddress, vText, vDatetime, vRecur, Event, vDate
@@ -779,8 +784,63 @@ class CalendarEvent(models.Model):
         synchronize them with their Odoo calendar."""
         all_users = self.env["res.users"].search([("is_caldav_enabled", "=", True)])
         for user in all_users:
-            self.with_context(dont_notify=True)._poll_user_caldav_server(user)
-            # self._poll_user_caldav_server(user)
+            try:
+                with self.env.cr.savepoint():
+                    self.with_context(dont_notify=True)._poll_user_caldav_server(user)
+            except (DAVError, RequestException) as error:
+                _logger.warning(
+                    "CalDAV connection failed for user ID %s (%s); other calendars will continue",
+                    user.id, type(error).__name__,
+                )
+
+    def _caldav_preserves_local_event(self):
+        """Let source-owned calendar mirrors retain their source's authority."""
+        self.ensure_one()
+        preserve = getattr(self, "_calendar_sync_preserves_local_event", None)
+        return bool(preserve and preserve())
+
+    @api.model
+    def _caldav_local_versions(self, user, known_ids):
+        domain = self._caldav_owned_event_domain() + [
+            ("caldav_uid", "!=", False),
+            "|", ("user_id", "=", user.id), ("id", "in", sorted(known_ids)),
+        ]
+        # write_date alone can stay equal for multiple writes in one transaction.
+        # Hash import-relevant values in one ORM batch; never persist their text.
+        field_names = [
+            "write_date", "name", "start", "stop", "start_date", "stop_date",
+            "allday", "description", "location", "videocall_location",
+            "partner_ids", "user_id", "recurrence_id", "caldav_uid",
+            "caldav_recurrence_id", "rrule_type", "interval", "end_type",
+            "count", "until", "mon", "tue", "wed", "thu", "fri", "sat",
+            "sun", "month_by", "day", "weekday", "byday",
+        ]
+        field_names = [name for name in field_names if name in self._fields]
+        return {
+            str(row["id"]): hashlib.sha256(json.dumps(
+                row, default=str, sort_keys=True, separators=(",", ":"),
+            ).encode()).hexdigest()
+            for row in self.search_read(domain, field_names, load=None)
+        }
+
+    @api.model
+    def _caldav_collection_token(self, calendar):
+        try:
+            token = calendar.get_properties([dav.SyncToken()]).get(dav.SyncToken.tag)
+        except (DAVError, NotImplementedError):
+            # Older servers can still use the resource-content cache below.
+            return None
+        return token if isinstance(token, str) and token else None
+
+    @api.model
+    def _caldav_contact_version(self):
+        """New/changed known invitees must invalidate an otherwise unchanged import."""
+        contacts = self.env["res.partner"].search_read(
+            [("email", "!=", False)], ["email", "user_ids"], order="id", load=None,
+        )
+        return hashlib.sha256(json.dumps(
+            contacts, sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest()
 
     @api.model
     def _poll_user_caldav_server(self, user) -> None:
@@ -789,31 +849,107 @@ class CalendarEvent(models.Model):
 
         :param user: The res.user record for whom to synchronize events.
         """
-        _logger.info(f"Polling CalDAV server for user {user.name}")
+        self.env.cr.execute(
+            "SELECT pg_try_advisory_xact_lock(hashtext(%s), %s)",
+            ("caldav_sync.poll", user.id),
+        )
+        if not self.env.cr.fetchone()[0]:
+            return
+        _logger.info("Polling CalDAV server for user ID %s", user.id)
         calendar = user._get_caldav_client().calendar(url=user.caldav_calendar_url)
+        parameters = self.env["ir.config_parameter"].sudo()
+        cache_key = "caldav_sync.poll_cache.%s" % user.id
+        identity = hashlib.sha256(json.dumps([
+            user.id, user.caldav_calendar_url, user.caldav_username,
+        ]).encode()).hexdigest()
+        cached_text = parameters.get_param(cache_key, "")
+        try:
+            cached = json.loads(cached_text) if cached_text else {}
+        except (ValueError, TypeError):
+            cached = {}
+        if (
+            not isinstance(cached, dict) or cached.get("version") != 1
+            or cached.get("identity") != identity
+        ):
+            cached = {}
+        objects = cached.get("objects", {})
+        if not isinstance(objects, dict):
+            objects = {}
+        known_ids = {
+            event_id for entry in objects.values() if isinstance(entry, dict)
+            for event_id in entry.get("ids", []) if isinstance(event_id, int)
+        }
+        versions = self._caldav_local_versions(user, known_ids)
+        contact_version = self._caldav_contact_version()
+        contacts_unchanged = contact_version == cached.get("contact_version")
+        # Read before the snapshot so a change during fetching is seen next poll.
+        token = self._caldav_collection_token(calendar)
+        if (
+            token and token == cached.get("token")
+            and versions == cached.get("versions") and contacts_unchanged
+        ):
+            _logger.info("CalDAV calendar unchanged for user ID %s", user.id)
+            return
         events = calendar.events()
-        synced_events = self.env["calendar.event"]
+        synced_ids = set()
+        updated_objects = {}
+        processed = skipped = 0
         sync_complete = True
         for caldav_event in events:
             try:
+                data = caldav_event.data
+                digest = hashlib.sha256(
+                    data if isinstance(data, bytes) else data.encode("utf-8")
+                ).hexdigest()
+                resource_key = hashlib.sha256(
+                    str(caldav_event.url or digest).encode()
+                ).hexdigest()
+                previous = objects.get(resource_key, {})
+                if (
+                    contacts_unchanged and previous.get("digest") == digest
+                    and previous.get("ids")
+                    and all(
+                        str(event_id) in versions
+                        and versions[str(event_id)] == previous.get("versions", {}).get(str(event_id))
+                        for event_id in previous["ids"]
+                    )
+                ):
+                    synced_ids.update(previous["ids"])
+                    updated_objects[resource_key] = previous
+                    skipped += 1
+                    continue
                 # A malformed event must not poison the transaction or make the
                 # rest of the snapshot look like a deletion request.
                 with self.env.cr.savepoint():
                     ical_event = caldav_event.icalendar_instance
-                    synced_events |= self._sync_event_from_ical(ical_event, user)
+                    imported = self._sync_event_from_ical(ical_event, user)
+                synced_ids.update(imported.ids)
+                if imported:
+                    updated_objects[resource_key] = {"digest": digest, "ids": imported.ids}
+                    # A changed recurrence can affect a later cached resource too.
+                    for event_id in imported.ids:
+                        versions.pop(str(event_id), None)
+                processed += 1
+            except TransactionRollbackError:
+                # The whole transaction must retry; never cache a rolled-back import.
+                raise
             except Exception:
                 sync_complete = False
                 _logger.exception(
-                    "Failed to import a CalDAV event for user %s; "
+                    "Failed to import a CalDAV event for user ID %s; "
                     "orphan cleanup will be skipped",
-                    user.name,
+                    user.id,
                 )
 
         if not sync_complete:
             _logger.warning(
-                "Skipping CalDAV orphan cleanup for user %s because the "
+                "Skipping CalDAV orphan cleanup for user ID %s because the "
                 "remote snapshot was not imported completely",
-                user.name,
+                user.id,
+            )
+            self._save_caldav_poll_cache(
+                user, parameters, cache_key, cached_text, identity,
+                None, updated_objects,
             )
             return
 
@@ -822,11 +958,14 @@ class CalendarEvent(models.Model):
         orphaned_events = self.search(
             [
                 ("caldav_uid", "!=", False),
-                ("id", "not " "in", synced_events.ids),
+                ("id", "not in", sorted(synced_ids)),
                 ("user_id", "=", user.id),
             ] + self._caldav_owned_event_domain()
         )
         orphaned_events = orphaned_events._to_sync()
+        orphaned_events = orphaned_events.filtered(
+            lambda event: not event._caldav_preserves_local_event()
+        )
         if orphaned_events:
             base_orphans = orphaned_events.filtered(
                 lambda ev: ev.recurrence_id and ev.is_base_event
@@ -850,6 +989,32 @@ class CalendarEvent(models.Model):
                 **CALDAV_IMPORT_CONTEXT,
                 caldav_no_sync=True
             ).with_user(user).unlink()
+        self._save_caldav_poll_cache(
+            user, parameters, cache_key, cached_text, identity,
+            token, updated_objects,
+        )
+        _logger.info(
+            "CalDAV snapshot for user ID %s: %s processed, %s unchanged",
+            user.id, processed, skipped,
+        )
+
+    @api.model
+    def _save_caldav_poll_cache(
+        self, user, parameters, cache_key, cached_text, identity, token, objects,
+    ):
+        known_ids = {event_id for entry in objects.values() for event_id in entry["ids"]}
+        versions = self._caldav_local_versions(user, known_ids)
+        for entry in objects.values():
+            entry["versions"] = {
+                str(event_id): versions.get(str(event_id)) for event_id in entry["ids"]
+            }
+        value = json.dumps({
+            "version": 1, "identity": identity, "token": token,
+            "contact_version": self._caldav_contact_version(),
+            "objects": objects, "versions": versions,
+        }, sort_keys=True, separators=(",", ":"))
+        if value != cached_text:
+            parameters.set_param(cache_key, value)
 
     @api.model
     def _sync_event_from_ical(self, ical_event: icalendar.cal.Event, user: User):
@@ -874,6 +1039,11 @@ class CalendarEvent(models.Model):
             )
 
             existing_instance = self._get_existing_instance(uid, recurrence_id)
+            if existing_instance and any(
+                event._caldav_preserves_local_event() for event in existing_instance
+            ):
+                synced_events |= existing_instance
+                continue
             known_recurrence = self.env["calendar.recurrence"].with_context(
                 active_test=False
             ).search([("caldav_uid", "=", uid)], limit=1)
