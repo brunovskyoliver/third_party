@@ -164,7 +164,7 @@ class CalendarEvent(models.Model):
     # the recalculation timing is hard to control and we want to make sure we sync
     # some modifications before the UID changes with recurrence_id and other changes on
     # the record.
-    caldav_uid = fields.Char(string="CalDAV UID", store=True)
+    caldav_uid = fields.Char(string="CalDAV UID", store=True, index=True)
     # Recurrence ID in iCalendar is the date or datetime the event would have
     # been at if it followed the sequence. It is set by calendar.recurrence
     # when applying a recurrence.
@@ -1285,9 +1285,13 @@ class CalendarEvent(models.Model):
         # Add current user if not already in attendees
         if current_user_email not in attendee_emails:
             attendee_emails.append(current_user_email)
+        # An attendee or organizer without a parsable address yields "", and
+        # ("email", "in", [""]) also matches every contact without an email
+        # (mostly Socio clients), attaching a random one to staff events.
+        attendee_emails = [email for email in attendee_emails if email]
         existing_partners = self.env["res.partner"].search(
             [("email", "in", attendee_emails)]
-        )
+        ) if attendee_emails else self.env["res.partner"]
         final_attendees = {}
         # CalDAV invitees are external data.  Only link contacts that already
         # exist in Odoo; importing an event must never turn every attendee or
@@ -1321,6 +1325,8 @@ class CalendarEvent(models.Model):
         if organizer:
             email = _extract_vcal_email(organizer)
             _logger.info("Organizer email: %s", email)
+            if not email:
+                return self.env["res.partner"]
             partner = self.env["res.partner"].search([("email", "=", email)], limit=1)
             _logger.info("Found partner: %s", partner)
             return partner
