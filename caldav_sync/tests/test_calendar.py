@@ -136,6 +136,22 @@ class TestCalendarEvent(TransactionCase, CaldavTestCommon):
             {"name": "Synthetic partner 2", "email": "partner2@example.com"},
         ])
 
+    def test_attendee_without_email_never_matches_contacts_without_email(self):
+        # Prod 2026-10-08: an empty address matched the first of ~11k contacts
+        # without email (a Socio client) on 149 staff events.
+        no_email = self.env["res.partner"].create({"name": "AAA synthetic contact without email"})
+        event = icalendar.Event()
+        event.add("attendee", "mailto:partner1@example.com")
+        event.add("attendee", "CN=No address")
+        event.add("organizer", "CN=No address either")
+        partners = self.env["calendar.event"]._get_attendee_partners(event, self.user_1.partner_id.email)
+        self.assertNotIn(no_email, partners)
+        self.assertIn(self.user_1.partner_id, partners)
+        self.assertEqual(partners.filtered(lambda partner: partner.email == "partner1@example.com").mapped("name"),
+                         ["Synthetic partner 1"])
+        self.assertFalse(self.env["calendar.event"]._get_organizer_partner(event))
+        self.assertFalse(self.env["calendar.event"]._get_attendee_partners(icalendar.Event(), ""))
+
     def test_basic_event_from_server_create(self):
         user = self.user_1
         ics_path = _get_ics_path("basic.ics")
