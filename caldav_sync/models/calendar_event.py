@@ -155,6 +155,20 @@ def _parse_rrule_string(rrule_str: str) -> Dict[str, Any]:
     return result
 
 
+def _is_yearly_ical_event(ical_event) -> bool:
+    """Yearly series (birthdays, name days) are not synced into Odoo (owner, 2026-10-21)."""
+    for component in ical_event.walk():
+        if component.name != "VEVENT":
+            continue
+        rrule = component.get("rrule")
+        freqs = rrule.get("FREQ", []) if rrule else []
+        if isinstance(freqs, str):
+            freqs = [freqs]
+        if "YEARLY" in [str(freq).upper() for freq in freqs]:
+            return True
+    return False
+
+
 def _extract_vcal_email(vcal_address):
     email_regex = re.compile(r"[a-z0-9.\-+_]+@[a-z0-9.\-+_]+\.[a-z]+")
     res = email_regex.search(str(vcal_address))
@@ -894,10 +908,21 @@ class CalendarEvent(models.Model):
         synced_ids = set()
         updated_objects = {}
         processed = skipped = 0
+        yearly_uids = set()
         sync_complete = True
         for caldav_event in events:
             try:
                 data = caldav_event.data
+                raw = data if isinstance(data, bytes) else data.encode("utf-8")
+                if b"FREQ=YEARLY" in raw.upper():
+                    ical_event = caldav_event.icalendar_instance
+                    if _is_yearly_ical_event(ical_event):
+                        yearly_uids.update(
+                            str(component.get("uid"))
+                            for component in ical_event.walk()
+                            if component.name == "VEVENT"
+                        )
+                        continue
                 digest = hashlib.sha256(
                     data if isinstance(data, bytes) else data.encode("utf-8")
                 ).hexdigest()
@@ -952,6 +977,9 @@ class CalendarEvent(models.Model):
                 None, updated_objects,
             )
             return
+
+        if yearly_uids:
+            self._drop_yearly_caldav_events(user, yearly_uids)
 
         # TODO: check if this fails when the user is deleting someone else's event
         # TODO: check if we should send updates to invitees
@@ -1015,6 +1043,20 @@ class CalendarEvent(models.Model):
         }, sort_keys=True, separators=(",", ":"))
         if value != cached_text:
             parameters.set_param(cache_key, value)
+
+    @api.model
+    def _drop_yearly_caldav_events(self, user, uids) -> None:
+        """Remove Odoo copies of yearly CalDAV series; the CalDAV server keeps them."""
+        ctx = {**CALDAV_IMPORT_CONTEXT, "caldav_no_sync": True}
+        events = self.with_context(active_test=False).search(
+            [("caldav_uid", "in", list(uids)), ("user_id", "=", user.id)]
+            + self._caldav_owned_event_domain()
+        )
+        if not events:
+            return
+        recurrences = events.recurrence_id
+        events.with_context(**ctx).with_user(user).unlink()
+        recurrences.exists().with_context(**ctx).with_user(user).unlink()
 
     @api.model
     def _sync_event_from_ical(self, ical_event: icalendar.cal.Event, user: User):

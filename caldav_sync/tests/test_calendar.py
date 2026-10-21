@@ -392,6 +392,50 @@ class TestCalendarEvent(TransactionCase, CaldavTestCommon):
 
         self.assertTrue(event.exists())
 
+    def test_yearly_series_is_not_synced_and_existing_copy_is_removed(self):
+        user = self.user_1
+        old_copy = (
+            self.env["calendar.event"]
+            .with_user(user)
+            .with_context(caldav_no_sync=True, caldav_keep_ids=True, no_microsoft_sync=True, calendar_sync_source="caldav")
+            .create(
+                {
+                    "name": "Synthetic yearly",
+                    "user_id": user.id,
+                    "caldav_uid": "synthetic-yearly-uid",
+                    "start": datetime.now() + timedelta(days=3),
+                    "stop": datetime.now() + timedelta(days=3, hours=1),
+                }
+            )
+        )
+        yearly = icalendar.Calendar()
+        component = icalendar.Event()
+        component.add("uid", "synthetic-yearly-uid")
+        component.add("summary", "Synthetic yearly")
+        component.add("dtstart", datetime(2026, 11, 2, 9, 0))
+        component.add("dtend", datetime(2026, 11, 2, 10, 0))
+        component.add("rrule", {"freq": "yearly"})
+        yearly.add_component(component)
+
+        with patch("caldav.DAVClient") as MockDAVClient:
+            mock_calendar = MagicMock()
+            mock_calendar.events.return_value = [
+                MagicMock(
+                    data=yearly.to_ical(),
+                    url="yearly.ics",
+                    icalendar_instance=icalendar.Calendar.from_ical(yearly.to_ical()),
+                )
+            ]
+            MockDAVClient.return_value.calendar.return_value = mock_calendar
+            user._compute_is_caldav_enabled()
+            self.env["calendar.event"]._poll_user_caldav_server(user)
+            mock_calendar.event_by_uid.return_value.delete.assert_not_called()
+
+        self.assertFalse(old_copy.exists())
+        self.assertFalse(
+            self.env["calendar.event"].search([("caldav_uid", "=", "synthetic-yearly-uid")])
+        )
+
     def test_existing_recurrence_uid_is_reused_after_base_uid_drift(self):
         user = self.user_1
         ics_path = _get_ics_path("test_recurring.ics")
