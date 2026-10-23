@@ -84,7 +84,7 @@ class RecurrenceRule(models.Model):
             self
         ):
             vals_list = [dict(vals, need_sync_m=False) for vals in vals_list]
-        if not self._context.get("caldav_keep_ids"):
+        if not self.env.context.get("caldav_keep_ids"):
             for vals in vals_list:
                 vals["caldav_uid"] = str(uuid.uuid4())
         else:

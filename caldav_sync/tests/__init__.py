@@ -4,3 +4,4 @@ from . import test_external_organizer
 from . import test_microsoft_ownership
 from . import test_poll_performance
 from . import test_password_storage
+from . import test_poll_health

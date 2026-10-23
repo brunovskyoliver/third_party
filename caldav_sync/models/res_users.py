@@ -1,10 +1,21 @@
+from datetime import timedelta
+import json
+
 from odoo import api, fields, models, _
 from odoo.exceptions import AccessError, UserError, ValidationError
 import caldav
 import logging
+from requests.exceptions import RequestException
 from urllib.parse import urlparse
 
 _logger = logging.getLogger(__name__)
+
+# Failed accounts wait 5, 10, 20 ... minutes before the next attempt, at most 6 h.
+CALDAV_RETRY_BASE_SECONDS = 300
+CALDAV_RETRY_MAX_SECONDS = 6 * 3600
+# A healthy account refreshes its last-success time at most this often, so the
+# shared system-parameter cache is not invalidated by every two-minute poll.
+CALDAV_SUCCESS_REFRESH_SECONDS = 3600
 
 
 class ResUsers(models.Model):
@@ -29,6 +40,9 @@ class ResUsers(models.Model):
     caldav_calendar_option_id = fields.Many2one(
         "caldav.calendar.option", string="CalDAV Calendar"
     )
+    # Configured with credentials the server accepted. An unreachable server
+    # keeps the account enabled; the poll job records reachability in the
+    # per-account health record (see _caldav_health).
     is_caldav_enabled = fields.Boolean(compute="_compute_is_caldav_enabled", store=True)
 
     _caldav_connection_fields = {
@@ -75,6 +89,9 @@ class ResUsers(models.Model):
             )
         # The cache holds the plain value until the end of the request.
         self.invalidate_recordset(["caldav_password"])
+        # The SQL write is invisible to the ORM; on create the stored flag was
+        # already computed without the password, so compute it again.
+        self.env.add_to_compute(self._fields["is_caldav_enabled"], self)
 
     def _get_caldav_password(self):
         self.ensure_one()
@@ -141,9 +158,83 @@ class ResUsers(models.Model):
             vals["caldav_calendar_option_id"] = False
 
         result = super().write(vals)
+        if self._caldav_connection_fields.intersection(vals) or option_selected:
+            # New connection settings deserve an immediate attempt.
+            self._caldav_reset_health()
         if not option_selected and self._caldav_connection_fields.intersection(vals):
             self._refresh_caldav_calendar_options()
         return result
+
+    # Per-account health lives in a system parameter (settings administrators
+    # only) as content-free JSON: timestamps, the exception class name and a
+    # counter, never a message, URL or credential. Keeping it out of res_users
+    # needs no schema change on the loaded release copy.
+    def _caldav_health_key(self):
+        return "caldav_sync.health.%s" % self.id
+
+    def _caldav_health(self):
+        self.ensure_one()
+        text = self.env["ir.config_parameter"].sudo().get_param(
+            self._caldav_health_key(), ""
+        )
+        try:
+            health = json.loads(text) if text else {}
+        except (TypeError, ValueError):
+            health = {}
+        return health if isinstance(health, dict) else {}
+
+    def _caldav_set_health(self, health):
+        self.ensure_one()
+        self.env["ir.config_parameter"].sudo().set_param(
+            self._caldav_health_key(),
+            json.dumps(health, sort_keys=True, separators=(",", ":")) if health else False,
+        )
+
+    def _caldav_reset_health(self):
+        for user in self:
+            health = user._caldav_health()
+            if health.get("streak") or health.get("next_retry"):
+                user._caldav_set_health({
+                    key: value for key, value in health.items() if key == "last_success"
+                })
+
+    def _caldav_record_poll(self, error=None, backoff=True):
+        """Store the outcome of one poll attempt; called by the poll job.
+
+        Only connection failures (backoff=True) delay the next attempt."""
+        now = fields.Datetime.now()
+        stamp = fields.Datetime.to_string(now)
+        for user in self:
+            health = user._caldav_health()
+            if error is None:
+                last = fields.Datetime.to_datetime(health.get("last_success"))
+                if (
+                    not health.get("streak") and not health.get("failure_class")
+                    and last and (now - last).total_seconds() < CALDAV_SUCCESS_REFRESH_SECONDS
+                ):
+                    continue
+                user._caldav_set_health({"last_success": stamp})
+                continue
+            streak = int(health.get("streak") or 0) + 1
+            health.update({
+                "last_failure": stamp,
+                "failure_class": type(error).__name__[:64],
+                "streak": streak,
+            })
+            health.pop("next_retry", None)
+            if backoff:
+                delay = min(
+                    CALDAV_RETRY_BASE_SECONDS * 2 ** min(streak - 1, 16),
+                    CALDAV_RETRY_MAX_SECONDS,
+                )
+                health["next_retry"] = fields.Datetime.to_string(
+                    now + timedelta(seconds=delay)
+                )
+            user._caldav_set_health(health)
+
+    def _caldav_retry_due(self, now=None):
+        next_retry = fields.Datetime.to_datetime(self._caldav_health().get("next_retry"))
+        return not next_retry or next_retry <= (now or fields.Datetime.now())
 
     @api.onchange("caldav_calendar_option_id")
     def _onchange_caldav_calendar_option_id(self):
@@ -187,9 +278,13 @@ class ResUsers(models.Model):
 
     @api.depends("caldav_username", "caldav_password", "caldav_calendar_url")
     def _compute_is_caldav_enabled(self):
-        """Compute whether CalDAV is enabled for each user by validating their credentials.
-        We only check if we can connect to the server and access the principal, without
-        fetching any events to avoid timeouts with large calendars."""
+        """CalDAV is enabled when the account is configured and the server
+        accepts it. We only access the principal, without fetching events.
+
+        An unreachable server (timeout, DNS, refused connection) does not
+        disable the account: this value is stored, so a transient failure
+        would otherwise drop the account from polling until its settings
+        change. The poll job records and backs off such failures instead."""
         for rec in self:
             # If any required field is empty, CalDAV is disabled
             if not (
@@ -204,6 +299,13 @@ class ResUsers(models.Model):
                 # Just try to access the principal, which is a lightweight operation
                 client.principal()
                 rec.is_caldav_enabled = True
+            except RequestException as error:
+                rec.is_caldav_enabled = True
+                _logger.warning(
+                    "CalDAV server unreachable while validating user ID %s (%s); "
+                    "the account stays enabled and the poll job will retry",
+                    rec.id, type(error).__name__,
+                )
             except Exception:
                 rec.is_caldav_enabled = False
                 _logger.error("Failed to validate CalDAV credentials for user ID %s", rec.id)

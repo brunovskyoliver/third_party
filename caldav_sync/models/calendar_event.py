@@ -1,3 +1,4 @@
+from time import monotonic
 import uuid
 import hashlib
 import json
@@ -216,7 +217,7 @@ class CalendarEvent(models.Model):
                     time.second,
                 )
             else:
-                if not self._context.get("caldav_keep_ids"):
+                if not self.env.context.get("caldav_keep_ids"):
                     event.caldav_uid = uuid.uuid4()
                 event.caldav_recurrence_id = False
 
@@ -506,7 +507,7 @@ class CalendarEvent(models.Model):
                 return index
 
     def _sync_unlink_to_caldav(self):
-        delete_all = self._context.get("caldav_delete_all", False)
+        delete_all = self.env.context.get("caldav_delete_all", False)
         if self.caldav_uid:
             for user in self.caldav_user_ids:
                 client = user._get_caldav_client()
@@ -795,17 +796,79 @@ class CalendarEvent(models.Model):
     @api.model
     def poll_caldav_server(self) -> None:
         """Poll each user's CalDAV calendar server for changes and
-        synchronize them with their Odoo calendar."""
-        all_users = self.env["res.users"].search([("is_caldav_enabled", "=", True)])
-        for user in all_users:
+        synchronize them with their Odoo calendar.
+
+        Accounts in a connection-failure backoff are skipped (outbound pushes
+        are not: skipping them would let the next successful poll delete the
+        unpushed events as orphans). A run stopped by the time budget leaves a
+        cursor so the next scheduled run starts with the accounts it did not
+        reach. As a cron, each account's outcome is committed on its own and
+        reported with remaining=0, so Odoo does not re-run the job at once."""
+        now = fields.Datetime.now()
+        enabled = self.env["res.users"].search([("is_caldav_enabled", "=", True)], order="id")
+        users = enabled.filtered(lambda user: user._caldav_retry_due(now))
+        parameters = self.env["ir.config_parameter"].sudo()
+        cursor_key = "caldav_sync.poll_cursor"
+        try:
+            cursor = int(parameters.get_param(cursor_key, 0) or 0)
+        except (TypeError, ValueError):
+            cursor = 0
+        if cursor:
+            users = users.filtered(lambda user: user.id >= cursor) + users.filtered(
+                lambda user: user.id < cursor
+            )
+        budget = self._caldav_poll_budget()
+        deadline = monotonic() + budget
+        in_cron = bool(self.env.context.get("ir_cron_progress_id"))
+        cron = self.env["ir.cron"]
+        next_cursor = 0
+        for index, user in enumerate(users):
+            if monotonic() >= deadline:
+                next_cursor = user.id
+                _logger.info(
+                    "CalDAV poll budget of %s s used; %s account(s) wait for the next run",
+                    budget, len(users) - index,
+                )
+                break
+            error = None
             try:
                 with self.env.cr.savepoint():
-                    self.with_context(dont_notify=True)._poll_user_caldav_server(user)
-            except (DAVError, RequestException) as error:
+                    polled = self.with_context(dont_notify=True)._poll_user_caldav_server(user)
+            except TransactionRollbackError:
+                raise
+            except (DAVError, RequestException) as exc:
+                error, backoff = exc, True
                 _logger.warning(
                     "CalDAV connection failed for user ID %s (%s); other calendars will continue",
-                    user.id, type(error).__name__,
+                    user.id, type(exc).__name__,
                 )
+            except Exception as exc:
+                # A code or data problem, not an unreachable server: record it
+                # but keep polling on schedule.
+                error, backoff = exc, False
+                _logger.exception(
+                    "CalDAV poll failed for user ID %s; other calendars will continue",
+                    user.id,
+                )
+            if error is not None or polled is not False:
+                user._caldav_record_poll(error, backoff=error is not None and backoff)
+            if in_cron:
+                # Commit this account. The job's own budget bounds the run;
+                # remaining=0 stops Odoo from looping it back to back.
+                cron._commit_progress(1, remaining=0)
+        if next_cursor != cursor:
+            parameters.set_param(cursor_key, next_cursor or False)
+
+    @api.model
+    def _caldav_poll_budget(self):
+        """Seconds one poll run may start new accounts (system parameter)."""
+        value = self.env["ir.config_parameter"].sudo().get_param(
+            "caldav_sync.poll_time_budget", "240"
+        )
+        try:
+            return max(float(value), 1.0)
+        except (TypeError, ValueError):
+            return 240.0
 
     def _caldav_preserves_local_event(self):
         """Let source-owned calendar mirrors retain their source's authority."""
@@ -868,7 +931,8 @@ class CalendarEvent(models.Model):
             ("caldav_sync.poll", user.id),
         )
         if not self.env.cr.fetchone()[0]:
-            return
+            # Another worker is polling this account; it records the outcome.
+            return False
         _logger.info("Polling CalDAV server for user ID %s", user.id)
         calendar = user._get_caldav_client().calendar(url=user.caldav_calendar_url)
         parameters = self.env["ir.config_parameter"].sudo()
