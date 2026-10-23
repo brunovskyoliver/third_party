@@ -1,0 +1,3 @@
+id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink
+access_user_selection_special,access.user.selection.special,model_user_selection,login_as_any_user.group_switch_users,1,1,1,1
+
