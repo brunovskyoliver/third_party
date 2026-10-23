@@ -19,8 +19,11 @@
 #    If not, see <http://www.gnu.org/licenses/>.
 #
 ###############################################################################
-from odoo import api, fields, models
+from odoo import _, api, fields, models
+from odoo.exceptions import AccessError
 from odoo.http import request
+
+SWITCH_GROUP = 'login_as_any_user.group_switch_users'
 
 
 class UserSelection(models.Model):
@@ -37,12 +40,29 @@ class UserSelection(models.Model):
     user_id = fields.Many2one('res.users', string="User",
                               required=True,
                               help="Select the user here",
-                              domain=lambda self: [
-                                  ('id', '!=', self.env.user.id)])
+                              domain=lambda self: self._target_user_domain())
     access_ids = fields.One2many('res.groups',
                                  'user_id',
                                  help="User groups for the selection",
                                  string="Group", readonly=True)
+
+    @api.model
+    def _target_user_domain(self):
+        domain = [('id', '!=', self.env.user.id)]
+        if not self.env.user._is_admin():
+            # Switchers without user-management rights must not become an administrator.
+            admins = self.env['res.users'].sudo().search([('share', '=', False)]).filtered(
+                lambda user: user._is_superuser() or user._is_admin())
+            domain.append(('id', 'not in', admins.ids))
+        return domain
+
+    def _check_switch_allowed(self):
+        actor = self.env.user
+        if not (actor._is_admin() or actor.has_group(SWITCH_GROUP)):
+            raise AccessError(_("Na prepínanie používateľov nemáte oprávnenie."))
+        target = self.user_id.sudo()
+        if not actor._is_admin() and (target._is_superuser() or target._is_admin()):
+            raise AccessError(_("Ako správca systému sa môže prihlásiť iba správca systému."))
 
     @api.onchange('user_id')
     def _onchange_user_id(self):
@@ -60,6 +80,7 @@ class UserSelection(models.Model):
             Main login page after logged in
         """
         self.ensure_one()
+        self._check_switch_allowed()
         session = request.session
         session.update({
             'previous_user': self.env.user.id,

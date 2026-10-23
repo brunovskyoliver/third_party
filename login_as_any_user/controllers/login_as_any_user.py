@@ -22,6 +22,8 @@
 from odoo import http
 from odoo.http import request
 
+SWITCH_GROUP = 'login_as_any_user.group_switch_users'
+
 
 class UserSwitch(http.Controller):
     """This is a controller to switch user and switch back to admin
@@ -39,7 +41,12 @@ class UserSwitch(http.Controller):
             Return:
                 weather the current user is admin or not
         """
-        return request.env.user._is_admin()
+        user = request.env.user
+        previous_uid = request.session.get('previous_user')
+        if previous_uid and previous_uid != user.id:
+            # Inside a switched session the button switches back.
+            return False
+        return user._is_admin() or user.has_group(SWITCH_GROUP)
 
     @http.route('/switch/admin', type='jsonrpc', auth='public')
     def switch_admin(self):
@@ -53,7 +60,8 @@ class UserSwitch(http.Controller):
 
         request.update_env(user=request.env.user)
 
-        if pre_user and pre_user._is_admin():
+        if pre_user.exists() and (pre_user._is_admin() or pre_user.has_group(SWITCH_GROUP)):
+            session.pop('previous_user', None)
             session.authenticate_without_password(
                 request.env.cr.dbname,
                 pre_user.login,
