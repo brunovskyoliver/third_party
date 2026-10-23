@@ -1,5 +1,5 @@
 from odoo import api, fields, models, _
-from odoo.exceptions import UserError, ValidationError
+from odoo.exceptions import AccessError, UserError, ValidationError
 import caldav
 import logging
 from urllib.parse import urlparse
@@ -14,7 +14,18 @@ class ResUsers(models.Model):
         string="CalDAV Calendar URL", default="https://caldav.icloud.com/"
     )
     caldav_username = fields.Char(string="CalDAV Username")
-    caldav_password = fields.Char(string="CalDAV Password")
+    # Write-only, like base's `password`: the value lives in the
+    # res_users.caldav_password column, which the ORM never reads, so no
+    # read, export, search or copy can return it. Only the owner (or a
+    # superuser job) can set it; see _set_caldav_password.
+    caldav_password = fields.Char(
+        string="CalDAV Password",
+        compute="_compute_caldav_password",
+        inverse="_set_caldav_password",
+        copy=False,
+        help="Uložené heslo sa z bezpečnostných dôvodov nezobrazuje. "
+        "Nové heslo zadajte len vtedy, keď ho chcete zmeniť.",
+    )
     caldav_calendar_option_id = fields.Many2one(
         "caldav.calendar.option", string="CalDAV Calendar"
     )
@@ -25,6 +36,53 @@ class ResUsers(models.Model):
         "caldav_username",
         "caldav_password",
     }
+
+    @property
+    def SELF_READABLE_FIELDS(self):
+        return super().SELF_READABLE_FIELDS + self._caldav_preference_fields
+
+    @property
+    def SELF_WRITEABLE_FIELDS(self):
+        return super().SELF_WRITEABLE_FIELDS + self._caldav_preference_fields
+
+    _caldav_preference_fields = [
+        "caldav_calendar_url",
+        "caldav_username",
+        "caldav_password",
+        "caldav_calendar_option_id",
+    ]
+
+    def init(self):
+        super().init()
+        self.env.cr.execute(
+            "ALTER TABLE res_users ADD COLUMN IF NOT EXISTS caldav_password varchar"
+        )
+
+    def _compute_caldav_password(self):
+        for user in self:
+            user.caldav_password = ""
+
+    def _set_caldav_password(self):
+        for user in self:
+            password = user.caldav_password or None
+            if not (self.env.su or user.id == self.env.uid) and (
+                password or not self.env.user._is_system()
+            ):
+                raise AccessError(_("Only the user can set their own CalDAV password."))
+            self.env.cr.execute(
+                "UPDATE res_users SET caldav_password = %s WHERE id = %s",
+                (password, user.id),
+            )
+        # The cache holds the plain value until the end of the request.
+        self.invalidate_recordset(["caldav_password"])
+
+    def _get_caldav_password(self):
+        self.ensure_one()
+        self.env.cr.execute(
+            "SELECT caldav_password FROM res_users WHERE id = %s", (self.id,)
+        )
+        row = self.env.cr.fetchone()
+        return row[0] if row else None
 
     def _sync_microsoft_calendar(self):
         """Run one Microsoft sync at a time and avoid CalDAV fan-out.
@@ -100,7 +158,7 @@ class ResUsers(models.Model):
                 (
                     user.caldav_calendar_url,
                     user.caldav_username,
-                    user.caldav_password,
+                    user._get_caldav_password(),
                 )
             ):
                 existing_options.unlink()
@@ -135,7 +193,9 @@ class ResUsers(models.Model):
         for rec in self:
             # If any required field is empty, CalDAV is disabled
             if not (
-                rec.caldav_username and rec.caldav_password and rec.caldav_calendar_url
+                rec.caldav_username
+                and rec._get_caldav_password()
+                and rec.caldav_calendar_url
             ):
                 rec.is_caldav_enabled = False
                 continue
@@ -153,7 +213,7 @@ class ResUsers(models.Model):
         return caldav.DAVClient(
             url=self.caldav_calendar_url,
             username=self.caldav_username,
-            password=self.caldav_password,
+            password=self._get_caldav_password(),
             timeout=30,
         )
 
