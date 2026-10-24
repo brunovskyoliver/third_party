@@ -29,6 +29,8 @@ MICROSOFT_DELETE_MODE_PARAM = "caldav_sync.microsoft_delete_mode"
 MICROSOFT_DELETE_MODE_LOG_ONLY = "log_only"
 MICROSOFT_SYNC_DIRECTION_PARAM = "caldav_sync.microsoft_sync_direction"
 MICROSOFT_SYNC_DIRECTION_IMPORT_ONLY = "import_only"
+# 2: adds the SQL fingerprint and the attendee-address keys (2026-10-24).
+CALDAV_POLL_CACHE_VERSION = 2
 CALDAV_IMPORT_CONTEXT = {
     "calendar_sync_source": CALDAV_SYNC_SOURCE,
     NO_MICROSOFT_SYNC_CONTEXT: True,
@@ -910,14 +912,91 @@ class CalendarEvent(models.Model):
         return token if isinstance(token, str) and token else None
 
     @api.model
-    def _caldav_contact_version(self):
-        """New/changed known invitees must invalidate an otherwise unchanged import."""
-        contacts = self.env["res.partner"].search_read(
-            [("email", "!=", False)], ["email", "user_ids"], order="id", load=None,
+    def _caldav_local_fingerprint(self, user, known_ids):
+        """One SQL digest that changes whenever a row behind _caldav_local_versions may.
+
+        It covers a superset of those records (archived ones too) and uses the
+        row versions (xmin) of each event and its recurrence plus the attendee
+        links, so any committed write changes it. A changed fingerprint only
+        means "compare the exact versions"; it never skips work by itself.
+        """
+        # Pending writes (and stored computes they trigger) must be in the rows.
+        self.env.flush_all()
+        self.env.cr.execute(
+            """
+            SELECT md5(COALESCE(string_agg(
+                       e.id::text || ':' || e.xmin::text || ':'
+                       || COALESCE(r.xmin::text, '') || ':' || COALESCE(p.ids, ''),
+                       ',' ORDER BY e.id), ''))
+              FROM calendar_event e
+         LEFT JOIN calendar_recurrence r ON r.id = e.recurrence_id
+         LEFT JOIN LATERAL (
+                    SELECT string_agg(rel.res_partner_id::text, '.'
+                                      ORDER BY rel.res_partner_id) AS ids
+                      FROM calendar_event_res_partner_rel rel
+                     WHERE rel.calendar_event_id = e.id
+                   ) p ON TRUE
+             WHERE e.caldav_uid IS NOT NULL
+               AND COALESCE(e.microsoft_id, '') = ''
+               AND COALESCE(e.ms_universal_event_id, '') = ''
+               AND COALESCE(e.microsoft_recurrence_master_id, '') = ''
+               AND (e.user_id = %s OR e.id = ANY(%s))
+            """,
+            (user.id, sorted(known_ids)),
         )
-        return hashlib.sha256(json.dumps(
-            contacts, sort_keys=True, separators=(",", ":"),
-        ).encode()).hexdigest()
+        return self.env.cr.fetchone()[0]
+
+    @api.model
+    def _caldav_email_key(self, email):
+        """Short, non-reversible key of an address exactly as it is matched."""
+        # Must equal left(md5(email), 16) in _caldav_contact_version (UTF-8 DB).
+        return hashlib.md5(email.encode()).hexdigest()[:16]
+
+    @api.model
+    def _caldav_ical_email_keys(self, ical_event, user):
+        """Keys of every address an import of ical_event looks contacts up by."""
+        emails = {user.partner_id.email or ""}
+        for component in ical_event.walk():
+            if component.name != "VEVENT":
+                continue
+            emails.update(self._get_ical_attendee_emails(component))
+            organizer = component.get("organizer")
+            if organizer:
+                emails.add(_extract_vcal_email(organizer))
+        return {self._caldav_email_key(email) for email in emails if email}
+
+    @api.model
+    def _caldav_contact_version(self, email_keys):
+        """Digest of the contacts an import can link: partners whose email is
+        one of the calendar's attendee/organizer addresses (email_keys).
+
+        A new, archived or re-addressed contact with such an address, or a
+        change to its users, invalidates an otherwise unchanged import; edits
+        to contacts this calendar never mentions do not.
+        """
+        self.env.flush_all()
+        self.env.cr.execute(
+            """
+            WITH p AS (
+                SELECT id, email, active, user_id
+                  FROM res_partner
+                 WHERE email IS NOT NULL AND left(md5(email), 16) = ANY(%s)
+            )
+            SELECT md5(
+                COALESCE((SELECT string_agg(
+                              p.id::text || ':' || p.email || ':' || p.active::text
+                              || ':' || COALESCE(p.user_id::text, ''),
+                              ',' ORDER BY p.id) FROM p), '')
+                || '|' ||
+                COALESCE((SELECT string_agg(
+                              u.id::text || ':' || u.partner_id::text || ':' || u.active::text,
+                              ',' ORDER BY u.id)
+                            FROM res_users u WHERE u.partner_id IN (SELECT id FROM p)), '')
+            )
+            """,
+            (sorted(email_keys),),
+        )
+        return self.env.cr.fetchone()[0]
 
     @api.model
     def _poll_user_caldav_server(self, user) -> None:
@@ -946,7 +1025,7 @@ class CalendarEvent(models.Model):
         except (ValueError, TypeError):
             cached = {}
         if (
-            not isinstance(cached, dict) or cached.get("version") != 1
+            not isinstance(cached, dict) or cached.get("version") != CALDAV_POLL_CACHE_VERSION
             or cached.get("identity") != identity
         ):
             cached = {}
@@ -957,15 +1036,25 @@ class CalendarEvent(models.Model):
             event_id for entry in objects.values() if isinstance(entry, dict)
             for event_id in entry.get("ids", []) if isinstance(event_id, int)
         }
-        versions = self._caldav_local_versions(user, known_ids)
-        contact_version = self._caldav_contact_version()
-        contacts_unchanged = contact_version == cached.get("contact_version")
+        email_keys = {
+            key for key in cached.get("email_keys", []) if isinstance(key, str)
+        }
         # Read before the snapshot so a change during fetching is seen next poll.
+        fingerprint = self._caldav_local_fingerprint(user, known_ids)
+        contact_version = self._caldav_contact_version(email_keys)
+        contacts_unchanged = bool(cached) and contact_version == cached.get("contact_version")
         token = self._caldav_collection_token(calendar)
-        if (
-            token and token == cached.get("token")
-            and versions == cached.get("versions") and contacts_unchanged
-        ):
+        remote_unchanged = token and token == cached.get("token") and contacts_unchanged
+        if remote_unchanged and fingerprint == cached.get("fingerprint"):
+            _logger.info("CalDAV calendar unchanged for user ID %s", user.id)
+            return
+        versions = self._caldav_local_versions(user, known_ids)
+        if remote_unchanged and versions == cached.get("versions"):
+            # Rows were rewritten without an import-relevant change.
+            self._save_caldav_poll_cache(
+                user, parameters, cache_key, cached_text, identity,
+                token, objects, email_keys,
+            )
             _logger.info("CalDAV calendar unchanged for user ID %s", user.id)
             return
         events = calendar.events()
@@ -1012,6 +1101,7 @@ class CalendarEvent(models.Model):
                 with self.env.cr.savepoint():
                     ical_event = caldav_event.icalendar_instance
                     imported = self._sync_event_from_ical(ical_event, user)
+                email_keys |= self._caldav_ical_email_keys(ical_event, user)
                 synced_ids.update(imported.ids)
                 if imported:
                     updated_objects[resource_key] = {"digest": digest, "ids": imported.ids}
@@ -1038,7 +1128,7 @@ class CalendarEvent(models.Model):
             )
             self._save_caldav_poll_cache(
                 user, parameters, cache_key, cached_text, identity,
-                None, updated_objects,
+                None, updated_objects, email_keys,
             )
             return
 
@@ -1083,7 +1173,7 @@ class CalendarEvent(models.Model):
             ).with_user(user).unlink()
         self._save_caldav_poll_cache(
             user, parameters, cache_key, cached_text, identity,
-            token, updated_objects,
+            token, updated_objects, email_keys,
         )
         _logger.info(
             "CalDAV snapshot for user ID %s: %s processed, %s unchanged",
@@ -1093,6 +1183,7 @@ class CalendarEvent(models.Model):
     @api.model
     def _save_caldav_poll_cache(
         self, user, parameters, cache_key, cached_text, identity, token, objects,
+        email_keys,
     ):
         known_ids = {event_id for entry in objects.values() for event_id in entry["ids"]}
         versions = self._caldav_local_versions(user, known_ids)
@@ -1101,8 +1192,10 @@ class CalendarEvent(models.Model):
                 str(event_id): versions.get(str(event_id)) for event_id in entry["ids"]
             }
         value = json.dumps({
-            "version": 1, "identity": identity, "token": token,
-            "contact_version": self._caldav_contact_version(),
+            "version": CALDAV_POLL_CACHE_VERSION, "identity": identity, "token": token,
+            "contact_version": self._caldav_contact_version(email_keys),
+            "email_keys": sorted(email_keys),
+            "fingerprint": self._caldav_local_fingerprint(user, known_ids),
             "objects": objects, "versions": versions,
         }, sort_keys=True, separators=(",", ":"))
         if value != cached_text:
