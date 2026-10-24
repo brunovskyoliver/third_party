@@ -1,4 +1,5 @@
 from datetime import datetime, UTC
+import json
 from unittest.mock import MagicMock, patch
 
 import caldav
@@ -215,3 +216,66 @@ class TestCalDAVPollPerformance(TransactionCase, CaldavTestCommon):
         partner.write({"email": "changed-invitee@example.test"})
         self._poll(resources)
         self.assertNotIn(partner, event.partner_ids)
+
+    def test_unchanged_poll_skips_orm_version_scan(self):
+        self.calendar.get_properties.return_value = {dav.SyncToken.tag: "token-1"}
+        resources = [self._resource("fingerprint-%s" % i) for i in range(5)]
+        self._poll(resources)
+        self.calendar.events.reset_mock()
+        with patch.object(
+            type(self.events), "_caldav_local_versions", wraps=self.events._caldav_local_versions,
+        ) as versions:
+            queries_before = self.env.cr.sql_log_count
+            self._poll(resources)
+            self.assertLess(self.env.cr.sql_log_count - queries_before, 10)
+        versions.assert_not_called()
+        self.calendar.events.assert_not_called()
+
+    def test_unrelated_contact_change_keeps_collection_cached(self):
+        self.calendar.get_properties.return_value = {dav.SyncToken.tag: "token-1"}
+        resources = [self._resource("unrelated-contact", attendees=["known@example.test"])]
+        self._poll(resources)
+        self.env["res.partner"].create({
+            "name": "Synthetic unrelated contact", "email": "unrelated@example.test",
+        })
+        self.calendar.events.reset_mock()
+        self._poll(resources)
+        self.calendar.events.assert_not_called()
+
+    def test_attendee_link_change_from_partner_side_invalidates_cache(self):
+        self.calendar.get_properties.return_value = {dav.SyncToken.tag: "token-1"}
+        resources = [self._resource("partner-side-link")]
+        self._poll(resources)
+        event = self.events.search([("caldav_uid", "=", "partner-side-link")])
+        partner = self.env["res.partner"].create({"name": "Synthetic linked contact"})
+        partner.write({"meeting_ids": [(4, event.id)]})
+        self.calendar.events.reset_mock()
+        self._poll(resources)
+        self.calendar.events.assert_called_once()
+        self.assertNotIn(partner, event.partner_ids)
+
+    def test_noop_rewrite_does_not_refetch_collection(self):
+        self.calendar.get_properties.return_value = {dav.SyncToken.tag: "token-1"}
+        resources = [self._resource("noop-rewrite")]
+        self._poll(resources)
+        event = self.events.search([("caldav_uid", "=", "noop-rewrite")])
+        self.env.cr.execute("UPDATE calendar_event SET name = name WHERE id = %s", (event.id,))
+        self.calendar.events.reset_mock()
+        self._poll(resources)
+        self._poll(resources)
+        self.calendar.events.assert_not_called()
+
+    def test_previous_cache_format_is_rebuilt(self):
+        self.calendar.get_properties.return_value = {dav.SyncToken.tag: "token-1"}
+        resources = [self._resource("cache-format")]
+        self._poll(resources)
+        parameters = self.env["ir.config_parameter"].sudo()
+        key = "caldav_sync.poll_cache.%s" % self.user.id
+        cached = json.loads(parameters.get_param(key))
+        cached["version"] = 1
+        parameters.set_param(key, json.dumps(cached))
+        self.calendar.events.reset_mock()
+        self._poll(resources)
+        self.calendar.events.assert_called_once()
+        self.assertEqual(json.loads(parameters.get_param(key))["version"], 2)
+
