@@ -9,7 +9,8 @@
                 <group string="CalDAV" class="text-break">
                     <field name="caldav_calendar_url" string="CalDAV URL kalendára"/>
                     <field name="caldav_username" string="Používateľské meno CalDAV"/>
-                    <field name="caldav_password" string="Heslo CalDAV" password="True"/>
+                    <field name="caldav_new_password" password="True"/>
+                    <field name="caldav_clear_password"/>
                     <field name="caldav_calendar_option_id" string="Vybraný kalendár"
                            domain="[('user_id', '=', id)]"
                            options="{'no_create': True, 'no_open': True}"/>
@@ -26,7 +27,8 @@
                 <group string="CalDAV" class="text-break">
                     <field name="caldav_calendar_url" string="CalDAV URL kalendára"/>
                     <field name="caldav_username" string="Používateľské meno CalDAV"/>
-                    <field name="caldav_password" string="Heslo CalDAV" password="True"/>
+                    <field name="caldav_new_password" password="True"/>
+                    <field name="caldav_clear_password"/>
                     <field name="caldav_calendar_option_id" string="Vybraný kalendár"
                            domain="[('user_id', '=', id)]"
                            options="{'no_create': True, 'no_open': True}"/>

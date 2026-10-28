@@ -1,10 +1,11 @@
-from odoo import api, fields, models, _
-from odoo.exceptions import UserError, ValidationError
+from odoo import SUPERUSER_ID, api, fields, models, _
+from odoo.exceptions import AccessError, UserError, ValidationError
 import caldav
 import logging
 from urllib.parse import urlparse
 
 _logger = logging.getLogger(__name__)
+_PASSWORD_INPUT_WRITE = object()
 
 
 class ResUsers(models.Model):
@@ -14,9 +15,24 @@ class ResUsers(models.Model):
         string="CalDAV Calendar URL", default="https://caldav.icloud.com/"
     )
     caldav_username = fields.Char(string="CalDAV Username")
-    caldav_password = fields.Char(string="CalDAV Password")
+    # Keep the existing column so an upgrade preserves configured accounts.
+    # Like core OAuth tokens, the stored value is available only under sudo.
+    caldav_password = fields.Char(
+        string="CalDAV Password Store", groups=fields.NO_ACCESS,
+        copy=False, prefetch=False,
+    )
+    caldav_new_password = fields.Char(
+        string="Nové heslo CalDAV", compute="_compute_caldav_password_inputs",
+        inverse="_inverse_caldav_password_inputs", copy=False,
+        help="Uložené heslo sa nezobrazuje. Prázdne pole ponechá existujúce heslo.",
+    )
+    caldav_clear_password = fields.Boolean(
+        string="Odstrániť uložené heslo CalDAV",
+        compute="_compute_caldav_password_inputs",
+        inverse="_inverse_caldav_password_inputs", copy=False,
+    )
     caldav_calendar_option_id = fields.Many2one(
-        "caldav.calendar.option", string="CalDAV Calendar"
+        "caldav.calendar.option", string="CalDAV Calendar", copy=False,
     )
     is_caldav_enabled = fields.Boolean(compute="_compute_is_caldav_enabled", store=True)
 
@@ -25,6 +41,48 @@ class ResUsers(models.Model):
         "caldav_username",
         "caldav_password",
     }
+
+    @property
+    def SELF_READABLE_FIELDS(self):
+        return [name for name in super().SELF_READABLE_FIELDS if name != "caldav_password"] + [
+            "caldav_calendar_url", "caldav_username", "caldav_calendar_option_id",
+            "caldav_new_password", "caldav_clear_password",
+        ]
+
+    @property
+    def SELF_WRITEABLE_FIELDS(self):
+        return [name for name in super().SELF_WRITEABLE_FIELDS if name != "caldav_password"] + [
+            "caldav_calendar_url", "caldav_username", "caldav_calendar_option_id",
+            "caldav_new_password", "caldav_clear_password",
+        ]
+
+    def _compute_caldav_password_inputs(self):
+        for user in self:
+            user.caldav_new_password = False
+            user.caldav_clear_password = False
+
+    def _check_caldav_password_actor(self):
+        # An upstream preference override may already have applied sudo().
+        # Keep the original uid boundary; elevation alone is not actor authority.
+        if self.env.uid != SUPERUSER_ID and not (
+            self.env.user._is_internal()
+            and (self == self.env.user or self.env.user.has_group("base.group_system"))
+        ):
+            raise AccessError(_("Heslo CalDAV môže zmeniť iba jeho vlastník alebo správca."))
+
+    def _inverse_caldav_password_inputs(self):
+        self._check_caldav_password_actor()
+        for user in self:
+            password = user.caldav_new_password
+            clear = user.caldav_clear_password
+            if password and clear:
+                raise ValidationError(_("Zadajte nové heslo alebo odstráňte uložené heslo, nie oboje."))
+            if password or clear:
+                user.sudo().with_context(_caldav_password_input_write=_PASSWORD_INPUT_WRITE).write({
+                    "caldav_password": password or False,
+                })
+        # Do not return a just-submitted replacement from the shared ORM cache.
+        self.invalidate_recordset(["caldav_new_password", "caldav_clear_password"])
 
     def _sync_microsoft_calendar(self):
         """Run one Microsoft sync at a time and avoid CalDAV fan-out.
@@ -71,6 +129,9 @@ class ResUsers(models.Model):
 
     def write(self, vals):
         vals = dict(vals)
+        if {"caldav_new_password", "caldav_clear_password"}.intersection(vals):
+            # Core res.users elevates safe self-preference writes later on.
+            self._check_caldav_password_actor()
         option_selected = "caldav_calendar_option_id" in vals
         if option_selected and vals["caldav_calendar_option_id"]:
             option = self.env["caldav.calendar.option"].sudo().browse(
@@ -83,7 +144,14 @@ class ResUsers(models.Model):
             vals["caldav_calendar_option_id"] = False
 
         result = super().write(vals)
-        if not option_selected and self._caldav_connection_fields.intersection(vals):
+        connection_changed = (
+            self._caldav_connection_fields.intersection(vals)
+            or vals.get("caldav_new_password") or vals.get("caldav_clear_password")
+        )
+        if (
+            not option_selected and connection_changed
+            and self.env.context.get("_caldav_password_input_write") is not _PASSWORD_INPUT_WRITE
+        ):
             self._refresh_caldav_calendar_options()
         return result
 
@@ -100,7 +168,7 @@ class ResUsers(models.Model):
                 (
                     user.caldav_calendar_url,
                     user.caldav_username,
-                    user.caldav_password,
+                    user.sudo().caldav_password,
                 )
             ):
                 existing_options.unlink()
@@ -135,7 +203,7 @@ class ResUsers(models.Model):
         for rec in self:
             # If any required field is empty, CalDAV is disabled
             if not (
-                rec.caldav_username and rec.caldav_password and rec.caldav_calendar_url
+                rec.caldav_username and rec.sudo().caldav_password and rec.caldav_calendar_url
             ):
                 rec.is_caldav_enabled = False
                 continue
@@ -153,7 +221,7 @@ class ResUsers(models.Model):
         return caldav.DAVClient(
             url=self.caldav_calendar_url,
             username=self.caldav_username,
-            password=self.caldav_password,
+            password=self.sudo().caldav_password,
             timeout=30,
         )
 

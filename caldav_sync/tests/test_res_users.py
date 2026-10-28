@@ -1,4 +1,4 @@
-from odoo.tests import TransactionCase
+from odoo.tests import TransactionCase, tagged
 from odoo.exceptions import ValidationError
 from unittest.mock import patch, MagicMock
 from .common import CaldavTestCommon
@@ -9,6 +9,7 @@ from types import SimpleNamespace
 _logger = logging.getLogger(__name__)
 
 
+@tagged("post_install", "-at_install")
 class TestUsers(TransactionCase, CaldavTestCommon):
     @classmethod
     def setUpClass(cls):
