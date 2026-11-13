@@ -1,4 +1,4 @@
-from odoo.tests import TransactionCase
+from odoo.tests import TransactionCase, tagged
 from odoo.exceptions import ValidationError
 from unittest.mock import patch, MagicMock
 from .common import CaldavTestCommon
@@ -9,6 +9,7 @@ from types import SimpleNamespace
 _logger = logging.getLogger(__name__)
 
 
+@tagged("post_install", "-at_install")
 class TestUsers(TransactionCase, CaldavTestCommon):
     @classmethod
     def setUpClass(cls):
@@ -27,9 +28,9 @@ class TestUsers(TransactionCase, CaldavTestCommon):
     def test_caldav_enabled_false_without_credentials(self):
         """Test that is_caldav_enabled is False when any required field is missing."""
         # Test with missing URL - has username and password only
-        user1 = self._generate_user(
-            "test1", caldav_username="user1", caldav_password="pass1"
-        )
+        user1 = self._generate_user("test1", caldav_password="pass1")
+        # The default URL is now iCloud; explicitly clear it to test its absence.
+        user1.write({"caldav_calendar_url": False, "caldav_username": "user1"})
         self.assertFalse(user1.is_caldav_enabled)
 
         # Test with missing username - has password and URL only

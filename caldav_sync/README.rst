@@ -101,3 +101,32 @@ License
 
 This program is under the terms of the GNU Lesser General Public License (LGPL-3)
 For details, visit https://www.gnu.org/licenses/lgpl-3.0.en.html
+
+TENENET safety patch, 2026-11-13
+------------------------------
+
+Detached recurrence imports match UID plus the original recurrence position.
+They preserve event IDs, organizer, attendees and the detached structure. A
+master acknowledges existing occurrences without rebuilding or expanding the
+series. An unknown exception position fails the resource instead of guessing.
+
+Incomplete imports return a partial outcome to poll health. Cleanup uses one
+preflight archive budget, including excluded yearly resources: at most 20 rows
+and at most 5% of the account's active CalDAV-owned rows before import, rounded
+down. Empty responses and responses at or below 10% of the previous resource
+baseline cannot archive anything. Blocked cleanup leaves a WARNING and a
+persistent administrator activity. Source-owned mirrors, Microsoft-owned rows
+and detached historical occurrences are never cleanup candidates.
+
+Cleanup previously unlinked ordinary events and sometimes their whole series.
+It now archives individual candidates and respects ``caldav_no_sync`` in the
+archive path, so cleanup cannot delete remotely. No schema or XML changes are
+needed; activation is a restart with a parent submodule pin update. The first
+poll rebuilds version-2 caches as version 3. ``TestCalDAVDetachedSafety`` covers
+49 detached occurrences, normal recurrence, single updates/deletions, empty and
+partial snapshots, the cap and recurrence-base isolation.
+
+This belongs in the separate ``third_party`` repository. Implementing it only
+in the customer addon would require replacing the vendor's entire poll method
+and would leave its archive-to-remote-delete bug in place. The customer addon's
+source-ownership hooks and direct write/unlink guards remain authoritative.

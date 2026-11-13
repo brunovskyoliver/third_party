@@ -206,7 +206,7 @@ class TestCalendarEvent(TransactionCase, CaldavTestCommon):
         self.assertGreater(event.start, orig_start)
         self.assertGreater(event.stop, orig_stop)
 
-    def test_basic_event_from_server_delete(self):
+    def test_empty_response_preserves_basic_event(self):
         user = self.user_1
         ics_path = _get_ics_path("basic.ics")
         with _patch_caldav_with_events_from_ics(ics_path, user):
@@ -215,7 +215,8 @@ class TestCalendarEvent(TransactionCase, CaldavTestCommon):
         with _patch_caldav_with_events_from_ics(None, user):
             self.env["calendar.event"].poll_caldav_server()
         event = self.env["calendar.event"].search([("user_id", "=", user.id)])
-        self.assertFalse(event)
+        self.assertTrue(event)
+        self.assertTrue(all(event.mapped("active")))
 
     def test_microsoft_event_is_not_removed_by_caldav_orphan_cleanup(self):
         user = self.user_1
@@ -392,7 +393,7 @@ class TestCalendarEvent(TransactionCase, CaldavTestCommon):
 
         self.assertTrue(event.exists())
 
-    def test_yearly_series_is_not_synced_and_existing_copy_is_removed(self):
+    def test_yearly_series_is_not_synced_and_cleanup_obeys_cap(self):
         user = self.user_1
         old_copy = (
             self.env["calendar.event"]
@@ -431,10 +432,10 @@ class TestCalendarEvent(TransactionCase, CaldavTestCommon):
             self.env["calendar.event"]._poll_user_caldav_server(user)
             mock_calendar.event_by_uid.return_value.delete.assert_not_called()
 
-        self.assertFalse(old_copy.exists())
-        self.assertFalse(
-            self.env["calendar.event"].search([("caldav_uid", "=", "synthetic-yearly-uid")])
-        )
+        # A one-row account has a zero automatic archive allowance.
+        self.assertTrue(old_copy.exists())
+        self.assertTrue(old_copy.active)
+        self.assertEqual(self.env["calendar.event"].search_count([("caldav_uid", "=", "synthetic-yearly-uid")]), 1)
 
     def test_existing_recurrence_uid_is_reused_after_base_uid_drift(self):
         user = self.user_1
@@ -523,7 +524,7 @@ class TestCalendarEvent(TransactionCase, CaldavTestCommon):
         self.assertEqual(len(event.attendee_ids), 2)
         self.assertIn(user.partner_id, event.attendee_ids.partner_id)
 
-    def test_multiple_attendees_event_from_server_delete(self):
+    def test_empty_response_preserves_multiple_attendees(self):
         user = self.user_1
         ics_path = _get_ics_path("test_multi_attendee.ics")
         with _patch_caldav_with_events_from_ics(ics_path, user):
@@ -532,7 +533,8 @@ class TestCalendarEvent(TransactionCase, CaldavTestCommon):
         with _patch_caldav_with_events_from_ics(None, user):
             self.env["calendar.event"].poll_caldav_server()
         event = self.env["calendar.event"].search([("user_id", "=", user.id)])
-        self.assertFalse(event)
+        self.assertTrue(event)
+        self.assertTrue(all(event.mapped("active")))
 
     def test_multiple_user_attendees_event_from_server_create(self):
         """Test event has:

@@ -5,3 +5,5 @@ from . import test_microsoft_ownership
 from . import test_poll_performance
 from . import test_password_storage
 from . import test_poll_health
+
+from . import test_detached_safety

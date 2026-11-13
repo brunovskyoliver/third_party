@@ -11,6 +11,7 @@ from requests.exceptions import ReadTimeout
 from odoo.tests import TransactionCase, tagged
 
 from .common import CaldavTestCommon
+from ..models.calendar_event import CALDAV_POLL_CACHE_VERSION
 
 
 @tagged("post_install", "-at_install")
@@ -135,9 +136,9 @@ class TestCalDAVPollPerformance(TransactionCase, CaldavTestCommon):
                 self._poll([self._resource("retry-resource")])
 
     def test_complete_snapshot_removes_only_missing_ordinary_event(self):
-        resources = [self._resource("kept"), self._resource("removed")]
+        resources = [self._resource("kept")] + [self._resource("budget-%s" % i) for i in range(19)] + [self._resource("removed")]
         self._poll(resources)
-        self._poll(resources[:1])
+        self._poll(resources[:-1])
         self.assertTrue(self.events.search([("caldav_uid", "=", "kept")]))
         self.assertFalse(self.events.search([("caldav_uid", "=", "removed")]))
 
@@ -277,5 +278,5 @@ class TestCalDAVPollPerformance(TransactionCase, CaldavTestCommon):
         self.calendar.events.reset_mock()
         self._poll(resources)
         self.calendar.events.assert_called_once()
-        self.assertEqual(json.loads(parameters.get_param(key))["version"], 2)
+        self.assertEqual(json.loads(parameters.get_param(key))["version"], CALDAV_POLL_CACHE_VERSION)
 
