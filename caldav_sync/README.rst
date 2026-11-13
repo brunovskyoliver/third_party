@@ -105,28 +105,47 @@ For details, visit https://www.gnu.org/licenses/lgpl-3.0.en.html
 TENENET safety patch, 2026-11-13
 ------------------------------
 
-Detached recurrence imports match UID plus the original recurrence position.
-They preserve event IDs, organizer, attendees and the detached structure. A
-master acknowledges existing occurrences without rebuilding or expanding the
-series. An unknown exception position fails the resource instead of guessing.
+This customer patch lives in the separate ``third_party`` submodule. The
+parent must pin its reviewed commit. Activation requires ``-u caldav_sync``
+for the admin server action and the normal service restart; no new fields,
+tables or TENENET addon upgrade. The poll cache stays at version 2.
 
-Incomplete imports return a partial outcome to poll health. Cleanup uses one
-preflight archive budget, including excluded yearly resources: at most 20 rows
-and at most 5% of the account's active CalDAV-owned rows before import, rounded
-down. Empty responses and responses at or below 10% of the previous resource
-baseline cannot archive anything. Blocked cleanup leaves a WARNING and a
-persistent administrator activity. Source-owned mirrors, Microsoft-owned rows
-and detached historical occurrences are never cleanup candidates.
+Pure detached UID groups match singleton occurrences by normalized UTC
+RECURRENCE-ID, then an unambiguous start in the series timezone. A persisted
+hashed alias keeps that fallback stable after DTSTART moves again. IDs,
+organizer, attendees and stored recurrence positions stay intact. Mixed
+linked/plain plus detached UIDs fail closed and prevent that user's cleanup.
+TENENET mirrors are checked before ambiguity handling.
 
-Cleanup previously unlinked ordinary events and sometimes their whole series.
-It now archives individual candidates and respects ``caldav_no_sync`` in the
-archive path, so cleanup cannot delete remotely. No schema or XML changes are
-needed; activation is a restart with a parent submodule pin update. The first
-poll rebuilds version-2 caches as version 3. ``TestCalDAVDetachedSafety`` covers
-49 detached occurrences, normal recurrence, single updates/deletions, empty and
-partial snapshots, the cap and recurrence-base isolation.
+Incomplete imports report partial health and cannot clean up. Cleanup retains
+LIVE cb7707a candidate/remote-confirmation semantics: a missing linked base
+expands its whole active chain only after UID lookup returns NotFound. All
+selected occurrences are archived together, never unlinked. Reappearing remote
+positions reactivate their original IDs and restore the recurrence base.
+``caldav_no_sync`` prevents outbound deletion on the archive path.
 
-This belongs in the separate ``third_party`` repository. Implementing it only
-in the customer addon would require replacing the vendor's entire poll method
-and would leave its archive-to-remote-delete bug in place. The customer addon's
-source-ownership hooks and direct write/unlink guards remain authoritative.
+The deliberate fewer-removals exceptions are source/Microsoft protection,
+proven sync origin, and refusal of destructive recurrence rewrites. Legacy
+rows without importer creation proof stay visible and log WARNING with skipped
+IDs; organizer ownership or cache membership is not proof of sync origin.
+An event imported by B cannot be cleaned up by organizer A's poll.
+
+The persisted rolling 24-hour breaker counts UID resources, not occurrence
+rows. Defaults are minimum small batch 5, minimum daily allowance 20, ratio
+0.10 of resource population. Parameters are ``caldav_sync.cleanup_small_batch``,
+``caldav_sync.cleanup_24h_min`` and ``caldav_sync.cleanup_24h_ratio``. Exceeding
+the cumulative allowance archives nothing for that user, logs WARNING and
+leaves an administrator TODO. Settings administrators may approve exactly the
+pending set once through Users > Action > Schváliť odstránenie; account, IDs,
+UIDs and row versions are checked again on the next complete poll. Restore
+never refunds the budget. Invalid ledger/settings fail closed.
+
+The separately committed ``caldav_sync.stop_requested=true`` flag stops a
+running poll at its next checkpoint and rolls back its current account. Prior
+account commits remain; the release runbook restores explicit logged IDs.
+
+Regression suites cover the six detached shapes, repeated DST overrides,
+normal recurrence, small deletions, confirmed whole-series deletions and false
+omissions over multiple polls, exact-set admin approval, cumulative caps,
+origin protection and TENENET source-owned mirrors. The pre-existing local
+"this and following" RecursionError remains a separate ticket.

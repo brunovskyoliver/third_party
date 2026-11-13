@@ -24,6 +24,7 @@
         "security/caldav_calendar_option_security.xml",
         "views/res_users_views.xml",
         "data/caldav_sync_data.xml",
+        "data/caldav_cleanup_action.xml",
     ],
     "installable": True,
     "application": True,

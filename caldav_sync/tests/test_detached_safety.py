@@ -139,21 +139,18 @@ class TestCalDAVDetachedSafety(TransactionCase, CaldavTestCommon):
         notices = self.env["mail.activity"].sudo().search([("res_model", "=", "res.partner"), ("res_id", "=", self.user.partner_id.id), ("summary", "=", "CalDAV: zablokované odstraňovanie udalostí")])
         self.assertEqual(len(notices), 1)
 
-    def test_five_percent_cap_is_atomic(self):
-        resources, events = self._ordinary_population()
-        with self.assertLogs(LOGGER, "WARNING"):
-            self._poll(resources[:-3])
-        self.assertEqual(len(events.filtered("active")), 40)
+    def test_five_deletions_in_small_calendar_are_allowed(self):
+        resources, events = self._ordinary_population(10)
+        self._poll(resources[:-5])
+        self.assertEqual(len(events.filtered("active")), 5)
+        self.assertEqual(len(events.exists()), 10)
 
-    def test_twenty_event_cap_is_atomic(self):
-        # Exercise the real cleanup on 420 local rows without 420 remote imports.
-        events = self._group(420, "cap-population")
-        self.env.cr.execute("UPDATE calendar_event SET recurrency = false WHERE id = ANY(%s)", (events.ids,))
-        events.invalidate_recordset()
+    def test_resource_circuit_breaker_is_atomic(self):
+        resources, events = self._ordinary_population(40)
         with self.assertLogs(LOGGER, "WARNING"):
-            outcome = self.events._caldav_cleanup_snapshot(self.user, set(events[:-21].ids), set(), 399, 420)
+            outcome = self._poll(resources[:-21])
         self.assertIsInstance(outcome, Exception)
-        self.assertEqual(len(events.filtered("active")), 420)
+        self.assertEqual(len(events.filtered("active")), 40)
 
     def test_incomplete_snapshot_does_not_archive_anything(self):
         resources, events = self._ordinary_population()
@@ -201,17 +198,17 @@ class TestCalDAVDetachedSafety(TransactionCase, CaldavTestCommon):
             return True
         with patch.object(type(self.events), "_sync_unlink_to_caldav") as remote_delete, \
                 patch.object(type(self.events), "unlink", autospec=True, side_effect=forbid_nonempty_unlink):
-            self.events._caldav_cleanup_snapshot(self.user, set(kept.ids), set(), 41, 44)
+            self.events._caldav_cleanup_snapshot(self.user, set(kept.ids), set(), 41, calendar=self.calendar, resource_baseline=41)
         remote_delete.assert_not_called()
         self.assertTrue(base.exists())
-        self.assertFalse(base.active)
+        self.assertTrue(base.active)
         self.assertTrue(all(kept.mapped("active")))
 
-    def test_yearly_exclusions_share_the_orphan_budget(self):
+    def test_yearly_exclusions_share_the_resource_history(self):
         resources, events = self._ordinary_population()
-        # One missing ordinary event plus two excluded birthdays exceeds 2/40.
+        # Three resources are below the rolling allowance and archive together.
         yearly_uids = set(events[:2].mapped("caldav_uid"))
         with self.assertLogs(LOGGER, "WARNING"):
             outcome = self.events._caldav_cleanup_snapshot(self.user, set(events[:-1].ids), yearly_uids, 39, 40)
-        self.assertIsInstance(outcome, Exception)
-        self.assertEqual(len(events.exists().filtered("active")), 40)
+        self.assertIsNone(outcome)
+        self.assertEqual(len(events.exists().filtered("active")), 37)
