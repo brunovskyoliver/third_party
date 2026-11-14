@@ -142,10 +142,17 @@ class TestCalDAVReworkSafety(TransactionCase):
         series = self.events.search([("caldav_uid", "=", "lost-rrule")])
         original_ids = set(series.ids)
         master.pop("rrule")
-        with self.assertLogs(LOGGER, "WARNING") as logs:
+        with patch.object(type(self.events), "_sync_unlink_to_caldav"), \
+                patch.object(type(self.events), "_sync_write_to_caldav"), \
+                self.assertLogs(LOGGER, "WARNING") as logs:
             outcome = self._poll(resources + [self._resource([master])])
         self.assertIsNone(outcome)
         self.assertTrue(any("review" in line.lower() for line in logs.output))
+        self.assertFalse(any("ERROR" in line for line in logs.output))
+        self.assertTrue(self.env["mail.activity"].sudo().search_count([
+            ("res_id", "=", self.user.partner_id.id),
+            ("summary", "=", "CalDAV: vyžaduje kontrolu (recurrence)"),
+        ]))
         self.assertEqual(set(series.exists().filtered("active").ids), original_ids)
         self.assertEqual(len(ordinary.filtered("active")), 40)
 
@@ -157,10 +164,17 @@ class TestCalDAVReworkSafety(TransactionCase):
         original_ids = set(series.ids)
         changed_master = self._component("changed-rrule")
         changed_master.add("rrule", {"freq": "weekly", "count": 4, "interval": 2})
-        with self.assertLogs(LOGGER, "WARNING") as logs:
+        with patch.object(type(self.events), "_sync_unlink_to_caldav"), \
+                patch.object(type(self.events), "_sync_write_to_caldav"), \
+                self.assertLogs(LOGGER, "WARNING") as logs:
             outcome = self._poll([self._resource([changed_master])])
         self.assertIsNone(outcome)
         self.assertTrue(any("review" in line.lower() for line in logs.output))
+        self.assertFalse(any("ERROR" in line for line in logs.output))
+        self.assertTrue(self.env["mail.activity"].sudo().search_count([
+            ("res_id", "=", self.user.partner_id.id),
+            ("summary", "=", "CalDAV: vyžaduje kontrolu (recurrence)"),
+        ]))
         self.assertEqual(set(series.exists().filtered("active").ids), original_ids)
         self.assertEqual(self.events.search_count([("caldav_uid", "=", "changed-rrule")]), 4)
 
@@ -205,7 +219,7 @@ class TestCalDAVReworkSafety(TransactionCase):
 
     def test_admin_approval_releases_exact_pending_set_once(self):
         from odoo.exceptions import AccessError, UserError
-        resources, events = self._ordinary_population(40)
+        resources, events = self._ordinary_population(60)
         with self.assertLogs(LOGGER, "WARNING"):
             self._poll(resources[:-25])
         with self.assertRaises(AccessError):
@@ -215,32 +229,32 @@ class TestCalDAVReworkSafety(TransactionCase):
         action.with_context(active_model="res.users", active_id=self.user.id, active_ids=[self.user.id]).run()
         with self.assertLogs(LOGGER, "WARNING"):
             self.assertIsNone(self._poll(resources[:-25]))
-        self.assertEqual(len(events.filtered("active")), 15)
-        self.assertEqual(len(events.exists()), 40)
+        self.assertEqual(len(events.filtered("active")), 35)
+        self.assertEqual(len(events.exists()), 60)
         state = self.events._caldav_safety_state(self.user)
         self.assertNotIn("approval", state)
         self.assertNotIn("pending", state)
         with self.assertRaises(UserError):
             self.events._caldav_approve_cleanup(self.user)
         self._poll(resources)
-        self.assertEqual(len(events.filtered("active")), 40)
+        self.assertEqual(len(events.filtered("active")), 60)
         with self.assertLogs(LOGGER, "WARNING"):
             self.assertIsInstance(self._poll(resources[:-25]), CalDAVPartialSyncError)
-        self.assertEqual(len(events.filtered("active")), 40)
+        self.assertEqual(len(events.filtered("active")), 60)
 
     def test_approval_cannot_release_changed_set_or_edited_rows(self):
-        resources, events = self._ordinary_population(40)
+        resources, events = self._ordinary_population(60)
         with self.assertLogs(LOGGER, "WARNING"):
             self._poll(resources[:-25])
         self.events._caldav_approve_cleanup(self.user)
-        events[15].with_context(caldav_no_sync=True, no_microsoft_sync=True).write({"name": "Locally edited pending row"})
+        events[-1].with_context(caldav_no_sync=True, no_microsoft_sync=True).write({"name": "Locally edited pending row"})
         with self.assertLogs(LOGGER, "WARNING"):
             self.assertIsInstance(self._poll(resources[:-25]), CalDAVPartialSyncError)
-        self.assertEqual(len(events.filtered("active")), 40)
+        self.assertEqual(len(events.filtered("active")), 60)
         self.events._caldav_approve_cleanup(self.user)
         with self.assertLogs(LOGGER, "WARNING"):
             self.assertIsInstance(self._poll(resources[:1]), CalDAVPartialSyncError)
-        self.assertEqual(len(events.filtered("active")), 40)
+        self.assertEqual(len(events.filtered("active")), 60)
 
     def test_dst_thirty_five_weekly_occurrences_keep_original_ids(self):
         import pytz

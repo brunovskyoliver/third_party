@@ -19,3 +19,9 @@ from . import test_live_delta
 from . import test_review_a2
 
 from . import test_review_b2_probes
+
+from . import test_review_a3
+
+from . import test_round4_safety
+
+from . import test_review_b3_probes

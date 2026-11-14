@@ -146,11 +146,11 @@ class TestCalDAVDetachedSafety(TransactionCase, CaldavTestCommon):
         self.assertEqual(len(events.exists()), 10)
 
     def test_resource_circuit_breaker_is_atomic(self):
-        resources, events = self._ordinary_population(40)
+        resources, events = self._ordinary_population(60)
         with self.assertLogs(LOGGER, "WARNING"):
             outcome = self._poll(resources[:-21])
         self.assertIsInstance(outcome, Exception)
-        self.assertEqual(len(events.filtered("active")), 40)
+        self.assertEqual(len(events.filtered("active")), 60)
 
     def test_incomplete_snapshot_does_not_archive_anything(self):
         resources, events = self._ordinary_population()

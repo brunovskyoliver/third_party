@@ -122,13 +122,14 @@ class TestReviewB2Probes(TransactionCase, CaldavTestCommon):
     def test_p10_local_created_event_deleted_remotely(self):
         ordinary = self._ordinary(30)
         self._poll(ordinary)
-        local = self.events.with_context(caldav_no_sync=True, no_microsoft_sync=True).create({
+        pushed = MagicMock()
+        pushed.vobject_instance.vevent.uid.value = "odoo-local-1"
+        self.calendar.save_event.return_value = pushed
+        local = self.events.with_context(no_microsoft_sync=True).create({
             "name": "Created in Odoo", "start": datetime(2030, 4, 1, 9), "stop": datetime(2030, 4, 1, 10),
-            "user_id": self.user.id, "partner_ids": [(6, 0, self.user.partner_id.ids)], "caldav_uid": "odoo-local-1",
+            "user_id": self.user.id, "partner_ids": [(6, 0, self.user.partner_id.ids)],
         })
-        # Model the successful Odoo -> CalDAV push. The production outbound
-        # path records this provenance after receiving the remote UID.
-        self.events._caldav_record_created(self.user, local)
+        self.assertIn(str(local.id), self.events._caldav_safety_state(self.user)["created"])
         echoed = self._resource([self._component("odoo-local-1", start=datetime(2030, 4, 1, 9), title="Created in Odoo")])
         self._poll(ordinary + [echoed])
         results = [self._poll(ordinary) for _ in range(2)]
