@@ -152,6 +152,7 @@ class TestReviewA2(TransactionCase, CaldavTestCommon):
         self._poll(ordinary + series)
         rows = self.events.search([("caldav_uid", "like", "rows-%")])
         self.assertEqual(len(rows), 102)
+        self.gone.update({"rows-0", "rows-1"})
         outcome = self._poll(ordinary)
         self.assertIsInstance(outcome, Exception)
         self.assertEqual(len(rows.filtered("active")), 102)
