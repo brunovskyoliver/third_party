@@ -215,7 +215,8 @@ class TestCalendarEvent(TransactionCase, CaldavTestCommon):
         with _patch_caldav_with_events_from_ics(None, user):
             self.env["calendar.event"].poll_caldav_server()
         event = self.env["calendar.event"].search([("user_id", "=", user.id)])
-        self.assertFalse(event)
+        self.assertEqual(len(event), 1)
+        self.assertTrue(event.active)
 
     def test_microsoft_event_is_not_removed_by_caldav_orphan_cleanup(self):
         user = self.user_1
@@ -535,7 +536,8 @@ class TestCalendarEvent(TransactionCase, CaldavTestCommon):
         with _patch_caldav_with_events_from_ics(None, user):
             self.env["calendar.event"].poll_caldav_server()
         event = self.env["calendar.event"].search([("user_id", "=", user.id)])
-        self.assertFalse(event)
+        self.assertEqual(len(event), 1)
+        self.assertTrue(all(event.mapped("active")))
 
     def test_multiple_user_attendees_event_from_server_create(self):
         """Test event has:

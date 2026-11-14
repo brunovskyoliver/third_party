@@ -46,6 +46,19 @@ class CalDAVPartialSyncError(Exception):
     """An imported subset is useful, but must not be reported as a success."""
 
 
+class CalDAVResourceReview(CalDAVPartialSyncError):
+    """A supported refusal, reported once as WARNING rather than a code error."""
+
+    def __init__(self, uid, event_ids, kind="recurrence"):
+        super().__init__("CalDAV resource requires review")
+        self.uid = uid
+        self.event_ids = event_ids
+        self.kind = kind
+
+
+CalDAVRecurrenceReview = CalDAVResourceReview
+
+
 if TYPE_CHECKING:
     from odoo.addons.base.models.res_users import Users as User
     from odoo.addons.base.models.res_partner import Partner
@@ -374,6 +387,8 @@ class CalendarEvent(models.Model):
                         event.with_context(caldav_no_sync=True).write(
                             {"caldav_uid": caldav_uid}
                         )
+                        created = event.recurrence_id.calendar_event_ids if event.recurrence_id else event
+                        self._caldav_record_created(user, created)
                 except Exception as e:
                     _logger.error(
                         f"Failed to sync event to CalDAV server: {e}", exc_info=True
@@ -1081,12 +1096,26 @@ class CalendarEvent(models.Model):
         ] + self._caldav_owned_event_domain())
         cleanup_total = len(local_before)
         resource_baseline = max(len(objects), len(set(local_before.mapped("caldav_uid"))))
+        # Restore checks used to issue one search per resource. Load the
+        # inactive CalDAV rows once and pass the UID-indexed view through the
+        # import batch; this is also the only state needed for reactivation.
+        inactive_before = self.with_context(active_test=False).search([
+            ("user_id", "=", user.id), ("active", "=", False),
+            ("caldav_uid", "!=", False),
+        ] + self._caldav_owned_event_domain())
+        inactive_by_uid = {}
+        for event in inactive_before:
+            inactive_by_uid.setdefault(event.caldav_uid, self.browse())
+            inactive_by_uid[event.caldav_uid] |= event
         events = list(calendar.events())
         synced_ids = set()
         updated_objects = {}
         processed = skipped = 0
         yearly_uids = set()
         sync_complete = True
+        unexpected_failure = False
+        blocked_uids = set()
+        origin_batch = []
         for resource_index, caldav_event in enumerate(events):
             if resource_index % 25 == 0:
                 self._caldav_check_stop()
@@ -1126,7 +1155,10 @@ class CalendarEvent(models.Model):
                 # rest of the snapshot look like a deletion request.
                 with self.env.cr.savepoint():
                     ical_event = caldav_event.icalendar_instance
-                    imported = self._sync_event_from_ical(ical_event, user)
+                    imported = self._sync_event_from_ical(
+                        ical_event, user, origin_batch=origin_batch,
+                        restore_rows_by_uid=inactive_by_uid,
+                    )
                 email_keys |= self._caldav_ical_email_keys(ical_event, user)
                 synced_ids.update(imported.ids)
                 if imported:
@@ -1138,16 +1170,28 @@ class CalendarEvent(models.Model):
             except TransactionRollbackError:
                 # The whole transaction must retry; never cache a rolled-back import.
                 raise
+            except CalDAVResourceReview as error:
+                blocked_uids.add(error.uid)
+                self._caldav_review_notice(
+                    user, error.kind, resource_key, digest, error.event_ids,
+                )
+                if error.kind == "mixed":
+                    # A detached UID taking over a linked/plain resource is a
+                    # user-level snapshot ambiguity. Keep imported rows, but
+                    # fail closed for cleanup of every resource in this poll.
+                    sync_complete = False
             except Exception:
                 sync_complete = False
+                unexpected_failure = True
                 _logger.exception(
                     "Failed to import a CalDAV event for user ID %s; "
                     "orphan cleanup will be skipped",
                     user.id,
                 )
 
+        self._caldav_flush_origin_batch(origin_batch)
         if not sync_complete:
-            _logger.warning(
+            (_logger.warning if unexpected_failure else _logger.info)(
                 "Skipping CalDAV orphan cleanup for user ID %s because the "
                 "remote snapshot was not imported completely",
                 user.id,
@@ -1158,9 +1202,11 @@ class CalendarEvent(models.Model):
             )
             return CalDAVPartialSyncError("Incomplete CalDAV snapshot")
 
+        self._caldav_backfill_origin(user, synced_ids)
         cleanup_error = self._caldav_cleanup_snapshot(
             user, synced_ids, yearly_uids, len(events), cleanup_total,
             resource_baseline=resource_baseline, calendar=calendar,
+            blocked_uids=blocked_uids,
         )
 
         self._save_caldav_poll_cache(
@@ -1230,33 +1276,162 @@ class CalendarEvent(models.Model):
                     raise ValueError()
         except (ValueError, TypeError, KeyError, AttributeError):
             raise CalDAVPartialSyncError("Invalid CalDAV safety ledger") from None
+        return self._caldav_prune_safety_state(state)
+
+    @api.model
+    def _caldav_prune_safety_state(self, state):
+        """Bound nonessential history; never refund the rolling 24 h budget."""
+        state.setdefault("positions", {})
+        cutoff = fields.Datetime.now() - timedelta(days=90)
+        ids = {int(key) for key in state["created"] if str(key).isdigit()}
+        ids.update(entry.get("id") for entry in state.get("positions", {}).values()
+                   if isinstance(entry, dict) and type(entry.get("id")) is int)
+        rows = self.with_context(active_test=False).browse(sorted(ids)).exists()
+        created_dates = {event.id: event.create_date for event in rows}
+
+        def retained(entry, event_id):
+            if event_id not in created_dates or not isinstance(entry, dict):
+                return False
+            try:
+                at = fields.Datetime.to_datetime(entry.get("at")) or created_dates[event_id]
+                return bool(at and at >= cutoff)
+            except (ValueError, TypeError):
+                return False
+
+        state["created"] = {key: entry for key, entry in state["created"].items()
+                            if str(key).isdigit() and retained(entry, int(key))}
+        state["positions"] = {key: entry for key, entry in state.get("positions", {}).items()
+                              if isinstance(entry, dict) and retained(entry, entry.get("id"))}
+        state["archives"] = [entry for entry in state["archives"]
+                             if fields.Datetime.to_datetime(entry["at"]) >= cutoff]
         return state
 
     @api.model
     def _caldav_save_safety_state(self, user, state):
         self.env["ir.config_parameter"].sudo().set_param(
             "caldav_sync.safety.%s" % user.id,
-            json.dumps(state, sort_keys=True, separators=(",", ":")),
+            json.dumps(self._caldav_prune_safety_state(state), sort_keys=True, separators=(",", ":")),
         )
 
     @api.model
     def _caldav_origin_matches(self, event, state, identity):
-        return state["created"].get(str(event.id)) == {
-            "account": identity,
-            "uid": hashlib.sha256(event.caldav_uid.encode()).hexdigest(),
-        }
+        origin = state["created"].get(str(event.id), {})
+        return origin.get("account") == identity and origin.get("uid") == hashlib.sha256(event.caldav_uid.encode()).hexdigest()
 
     @api.model
-    def _caldav_record_created(self, user, events):
+    def _caldav_import_safety_state(self, user):
+        # Unreadable deletion evidence must not hide a newly imported meeting.
+        # Keep the corrupt value intact; only archiving is blocked until repair.
+        try:
+            return self._caldav_safety_state(user)
+        except CalDAVPartialSyncError:
+            self._caldav_review_notice(user, "ledger", "ledger", "invalid", [])
+            return None
+
+    @api.model
+    def _caldav_review_notice(self, user, kind, resource_key, fingerprint, event_ids):
+        """Warn once per unchanged review condition and leave an admin TODO."""
+        notice_key = "caldav_sync.review.%s.%s" % (
+            user.id, hashlib.sha256((kind + resource_key + fingerprint).encode()).hexdigest(),
+        )
+        parameters = self.env["ir.config_parameter"].sudo()
+        if parameters.get_param(notice_key):
+            return
+        parameters.set_param(notice_key, fields.Datetime.to_string(fields.Datetime.now()))
+        _logger.warning(
+            "CalDAV review required for user ID %s (%s), event IDs %s; no rows archived",
+            user.id, kind, sorted(event_ids),
+        )
+        activities = self.env["mail.activity"].sudo().with_context(mail_activity_quick_update=True)
+        summary = "CalDAV: vyžaduje kontrolu (%s)" % kind
+        if not activities.search_count([
+            ("res_model", "=", "res.partner"), ("res_id", "=", user.partner_id.id),
+            ("summary", "=", summary),
+        ]):
+            activities.create({
+                "res_model_id": self.env["ir.model"]._get_id("res.partner"),
+                "res_id": user.partner_id.id, "user_id": self.env.ref("base.user_admin").id,
+                "activity_type_id": self.env.ref("mail.mail_activity_data_todo").id,
+                "summary": summary,
+                "note": _(
+                    "CalDAV používateľa ID %(user)s vyžaduje kontrolu typu %(kind)s. "
+                    "Udalosti zostali viditeľné. ID: %(ids)s",
+                    user=user.id, kind=kind, ids=", ".join(map(str, sorted(event_ids))) or "žiadne",
+                ),
+            })
+
+    @api.model
+    def _caldav_record_created(self, user, events, origin_batch=None):
         """Called only for rows created by this import, in its savepoint."""
-        state = self._caldav_safety_state(user)
+        if origin_batch is not None:
+            origin_batch.append((user.id, events.ids))
+            return
+        state = self._caldav_import_safety_state(user)
+        if state is None:
+            return
         identity = self._caldav_account_identity(user)
         for event in events:
             state["created"][str(event.id)] = {
                 "account": identity,
                 "uid": hashlib.sha256(event.caldav_uid.encode()).hexdigest(),
+                "at": fields.Datetime.to_string(fields.Datetime.now()),
             }
         self._caldav_save_safety_state(user, state)
+
+    @api.model
+    def _caldav_flush_origin_batch(self, pending):
+        if not pending:
+            return
+        grouped = {}
+        for user_id, ids in pending:
+            grouped.setdefault(user_id, set()).update(ids)
+        for user_id, ids in grouped.items():
+            user = self.env["res.users"].browse(user_id)
+            state = self._caldav_import_safety_state(user)
+            if state is None:
+                continue
+            identity = self._caldav_account_identity(user)
+            now = fields.Datetime.to_string(fields.Datetime.now())
+            for event in self.with_context(active_test=False).browse(sorted(ids)).exists():
+                if event.caldav_uid:
+                    state["created"][str(event.id)] = {
+                        "account": identity,
+                        "uid": hashlib.sha256(event.caldav_uid.encode()).hexdigest(),
+                        "at": now,
+                    }
+            self._caldav_save_safety_state(user, state)
+
+    @api.model
+    def _caldav_backfill_origin(self, user, synced_ids):
+        marker = "caldav_sync.origin_backfill.%s" % user.id
+        parameters = self.env["ir.config_parameter"].sudo()
+        if parameters.get_param(marker):
+            return
+        state = self._caldav_import_safety_state(user)
+        if state is None:
+            return
+        known = set()
+        for parameter in parameters.search([("key", "like", "caldav_sync.safety.%")]):
+            try:
+                other = json.loads(parameter.value)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(other, dict) and isinstance(other.get("created"), dict):
+                known.update(int(event_id) for event_id in other["created"] if str(event_id).isdigit())
+        identity = self._caldav_account_identity(user)
+        now = fields.Datetime.to_string(fields.Datetime.now())
+        rows = self.with_context(active_test=False).browse(sorted(synced_ids)).exists().filtered(
+            lambda event: event.active and event.user_id == user and event.caldav_uid
+            and event.id not in known and not event._caldav_preserves_local_event()
+        )
+        for event in rows:
+            state["created"][str(event.id)] = {
+                "account": identity,
+                "uid": hashlib.sha256(event.caldav_uid.encode()).hexdigest(),
+                "at": now,
+            }
+        self._caldav_save_safety_state(user, state)
+        parameters.set_param(marker, now)
 
     @api.model
     def _caldav_check_stop(self):
@@ -1287,18 +1462,32 @@ class CalendarEvent(models.Model):
         return max(small, minimum, int(resource_count * ratio))
 
     @api.model
-    def _caldav_cleanup_plan(self, user, synced_ids, yearly_uids, calendar):
+    def _caldav_cleanup_meeting_limit(self):
+        try:
+            limit = int(self.env["ir.config_parameter"].sudo().get_param(
+                "caldav_sync.cleanup_24h_meetings", "100",
+            ))
+            if limit < 1:
+                raise ValueError()
+            return limit
+        except (TypeError, ValueError):
+            raise CalDAVPartialSyncError("Invalid CalDAV meeting-row limit") from None
+
+    @api.model
+    def _caldav_cleanup_plan(self, user, synced_ids, yearly_uids, calendar, blocked_uids=None):
         """LIVE cb7707a candidate selection and recurrence confirmation.
 
         Compute the whole set before any archive. A listing omission alone must
         not remove a recurrence: event_by_uid must explicitly return NotFound.
         Unlike LIVE, unioning sets also avoids unlinking differing rows twice.
         """
+        blocked_uids = blocked_uids or set()
         orphans = self.search([
             ("caldav_uid", "!=", False), ("id", "not in", sorted(synced_ids)),
             ("user_id", "=", user.id),
         ] + self._caldav_owned_event_domain())._to_sync().filtered(
-            lambda event: not event._caldav_preserves_local_event()
+            lambda event: event.caldav_uid not in blocked_uids
+            and not event._caldav_preserves_local_event()
         )
         base_orphans = orphans.filtered(lambda event: event.recurrence_id and event.is_base_event)
         candidates = orphans - base_orphans
@@ -1323,7 +1512,7 @@ class CalendarEvent(models.Model):
     @api.model
     def _caldav_cleanup_snapshot(
         self, user, synced_ids, yearly_uids, remote_count, total=None,
-        resource_baseline=0, calendar=None,
+        resource_baseline=0, calendar=None, blocked_uids=None,
     ):
         """Plan LIVE removals, apply origin guard and a 24 h resource breaker."""
         self.env.cr.execute(
@@ -1331,7 +1520,14 @@ class CalendarEvent(models.Model):
             ("caldav_sync.poll", user.id),
         )
         self._caldav_check_stop()
-        candidates = self._caldav_cleanup_plan(user, synced_ids, yearly_uids, calendar)
+        if resource_baseline and remote_count <= resource_baseline * 0.10:
+            self._caldav_review_notice(
+                user, "snapshot", "snapshot", str((resource_baseline, remote_count)), [],
+            )
+            return CalDAVPartialSyncError("Empty or near-empty CalDAV snapshot")
+        candidates = self._caldav_cleanup_plan(
+            user, synced_ids, yearly_uids, calendar, blocked_uids,
+        )
         try:
             state = self._caldav_safety_state(user)
             identity = self._caldav_account_identity(user)
@@ -1339,25 +1535,22 @@ class CalendarEvent(models.Model):
                 ("user_id", "=", user.id), ("caldav_uid", "!=", False),
             ] + self._caldav_owned_event_domain()).mapped("caldav_uid"))))
             limit = self._caldav_cleanup_limits(resource_count)
+            meeting_limit = self._caldav_cleanup_meeting_limit()
         except CalDAVPartialSyncError:
             _logger.warning("CalDAV cleanup blocked for user ID %s: invalid safety ledger or settings", user.id)
             self._caldav_cleanup_notice(user, len(candidates), 0)
             return CalDAVPartialSyncError("Invalid CalDAV safety ledger or settings")
         unproven = candidates.filtered(lambda event: not self._caldav_origin_matches(event, state, identity))
-        origin_error = None
         if unproven:
-            _logger.warning(
-                "CalDAV cleanup skipped user ID %s event IDs %s: origin is not proven "
-                "to be this account's sync; rows remain visible",
-                user.id, sorted(unproven.ids),
+            self._caldav_review_notice(
+                user, "origin", "origin", str(sorted(unproven.ids)), sorted(unproven.ids),
             )
             candidates -= unproven
-            origin_error = CalDAVPartialSyncError("Unproven CalDAV cleanup origin")
         if not candidates:
-            if state.pop("pending", None) or state.pop("approval", None):
-                state.pop("approval", None)
-                self._caldav_save_safety_state(user, state)
-            return origin_error
+            state.pop("pending", None)
+            state.pop("approval", None)
+            self._caldav_save_safety_state(user, state)
+            return
         # Prove the exact pending set, including each row's current version. An
         # edit, ownership change, different account or different candidate IDs
         # invalidates an approval. No raw remote UID is persisted.
@@ -1374,21 +1567,24 @@ class CalendarEvent(models.Model):
         recent = [entry for entry in state["archives"]
                   if fields.Datetime.to_datetime(entry["at"]) > now - timedelta(hours=24)]
         used = sum(len(entry["uids"]) for entry in recent)
+        meetings_used = sum(len(entry["ids"]) for entry in recent)
         approved = state.get("approval") == signature
-        if used + len(uids) > limit and not approved:
+        if (used + len(uids) > limit or meetings_used + len(candidates) > meeting_limit) and not approved:
             state["pending"] = {
                 "signature": signature, "ids": sorted(candidates.ids), "uids": uids,
                 "at": fields.Datetime.to_string(now), "resource_count": resource_count,
                 "used": used, "limit": limit,
+                "meetings_used": meetings_used, "meeting_limit": meeting_limit,
             }
             state.pop("approval", None)
             self._caldav_save_safety_state(user, state)
             _logger.warning(
                 "CalDAV circuit breaker user ID %s: pending %s resources / %s rows, "
-                "24h used %s, limit %s; event IDs %s. No rows archived",
-                user.id, len(uids), len(candidates), used, limit, sorted(candidates.ids),
+                "24h resources %s/%s, meetings %s/%s; event IDs %s. No rows archived",
+                user.id, len(uids), len(candidates), used, limit,
+                meetings_used, meeting_limit, sorted(candidates.ids),
             )
-            self._caldav_cleanup_notice(user, len(uids), limit)
+            self._caldav_cleanup_notice(user, len(uids), limit, len(candidates), meeting_limit)
             return CalDAVPartialSyncError("CalDAV circuit breaker requires approval")
         self._caldav_check_stop()
         state["archives"] = recent + [{
@@ -1400,14 +1596,14 @@ class CalendarEvent(models.Model):
         candidates.with_context(
             **CALDAV_IMPORT_CONTEXT, caldav_no_sync=True, caldav_keep_ids=True,
             dont_notify=True, skip_attendee_notification=True,
-        ).with_user(user).write({"active": False, "recurrence_update": "self_only"})
+        ).with_user(user).write({"active": False})
         _logger.warning(
             "CalDAV archived user ID %s event IDs %s at %s; resources %s; "
             "rolling 24h used %s/%s; one-time approval %s",
             user.id, sorted(candidates.ids), fields.Datetime.to_string(now),
             len(uids), used + len(uids), limit, approved,
         )
-        return origin_error
+        return
 
     @api.model
     def _caldav_approve_cleanup(self, users):
@@ -1438,7 +1634,7 @@ class CalendarEvent(models.Model):
         }}
 
     @api.model
-    def _caldav_cleanup_notice(self, user, count, limit):
+    def _caldav_cleanup_notice(self, user, count, limit, meetings=0, meeting_limit=0):
         """A durable, deduplicated TODO visible to the settings administrator.
 
         Contains only record IDs and counts. No attendee details or credentials.
@@ -1460,15 +1656,19 @@ class CalendarEvent(models.Model):
             "note": _(
                 "Synchronizácia používateľa ID %(user)s navrhla archivovať %(count)s "
                 "vzdialených zdrojov (24-hodinový limit %(limit)s). Nič sa neodstránilo. "
+                "Počet stretnutí %(meetings)s (24-hodinový limit %(meeting_limit)s). "
                 "Skontrolujte vzdialený kalendár a stav caldav_sync.health.%(user)s. "
                 "V Nastavenia > Používatelia vyberte používateľa ID %(user)s a akciu "
                 "Schváliť odstránenie. Schválenie platí iba pre presnú čakajúcu množinu.",
-                user=user.id, count=count, limit=limit,
+                user=user.id, count=count, limit=limit, meetings=meetings, meeting_limit=meeting_limit,
             ),
         })
 
     @api.model
-    def _sync_event_from_ical(self, ical_event: icalendar.cal.Event, user: User):
+    def _sync_event_from_ical(
+        self, ical_event: icalendar.cal.Event, user: User, origin_batch=None,
+        restore_rows_by_uid=None,
+    ):
         """Given an iCalendar event, compare the event with any existing
         Odoo event that it matches and synchronize the changes. If no event
         exists, create it regardless of its date.
@@ -1508,10 +1708,14 @@ class CalendarEvent(models.Model):
                     ("caldav_uid", "=", uid),
                 ])
                 if same_uid - detached or linked or known_chain:
-                    raise CalDAVPartialSyncError("Mixed detached and live CalDAV UID")
+                    raise CalDAVResourceReview(uid, same_uid.ids, "mixed")
                 synced_events |= self._sync_detached_caldav_component(component, user, detached)
                 continue
-            self._caldav_restore_remote_occurrences(component, user)
+            restore_rows = (
+                restore_rows_by_uid.get(uid, self.browse())
+                if restore_rows_by_uid is not None else None
+            )
+            self._caldav_restore_remote_occurrences(component, user, restore_rows)
             existing_instance = self._get_existing_instance(uid, recurrence_id)
             # Ambiguous data must stop this resource, never choose an arbitrary
             # record or send a multi-record set to singleton comparison code.
@@ -1578,7 +1782,7 @@ class CalendarEvent(models.Model):
                 ).create(values | recurrency_vals)
                 self.env["calendar.event"].flush_model()
                 created = new_event.recurrence_id.calendar_event_ids if new_event.recurrency else new_event
-                self._caldav_record_created(user, created)
+                self._caldav_record_created(user, created, origin_batch=origin_batch)
                 synced_events |= created
                 continue
             elif outdated or not owned:
@@ -1589,12 +1793,14 @@ class CalendarEvent(models.Model):
                 # unlinking or replacing real occurrences outside cleanup caps.
                 # A sync error is preferable. Individual exceptions may still
                 # move safely through the explicit self_only path below.
-                unsafe_changes = set(recurrence_changes) - {"follow_recurrence", "recurrence_update"}
+                unsafe_changes = set(recurrence_changes) - {
+                    "follow_recurrence", "recurrence_update", "until", "count",
+                }
                 if unsafe_changes or (
                     existing_instance.recurrence_id and not recurrence_id
                     and not component.get("rrule")
                 ):
-                    raise CalDAVPartialSyncError("CalDAV recurrence rewrite requires review")
+                    raise CalDAVResourceReview(uid, existing_instance.ids, "recurrence")
                 changed_vals = existing_instance._get_value_changes(values)
                 if component.get("recurrence-id") and "follow_recurrence" in recurrence_changes:
                     changed_vals["follow_recurrence"] = recurrence_changes["follow_recurrence"]
@@ -1603,7 +1809,7 @@ class CalendarEvent(models.Model):
                         **CALDAV_IMPORT_CONTEXT,
                         caldav_no_sync=True,
                         caldav_keep_ids=True,
-                    ).write({**changed_vals, "recurrence_update": "self_only"})
+                    ).write(changed_vals)
 
             if existing_instance.recurrency and existing_instance.is_base_event:
                 synced_events |= existing_instance.recurrence_id.calendar_event_ids
@@ -1612,7 +1818,7 @@ class CalendarEvent(models.Model):
         return synced_events
 
     @api.model
-    def _caldav_restore_remote_occurrences(self, component, user):
+    def _caldav_restore_remote_occurrences(self, component, user, rows=None):
         """Restore exact remote positions, never regenerate a recurrence.
 
         Remote presence can recover rows hidden by an earlier sync. For a
@@ -1623,9 +1829,10 @@ class CalendarEvent(models.Model):
         from dateutil.rrule import rrulestr
 
         uid = str(component.get("uid"))
-        rows = self.with_context(active_test=False).search([
-            ("caldav_uid", "=", uid), ("user_id", "=", user.id),
-        ] + self._caldav_owned_event_domain())
+        if rows is None:
+            rows = self.with_context(active_test=False).search([
+                ("caldav_uid", "=", uid), ("user_id", "=", user.id),
+            ] + self._caldav_owned_event_domain())
         inactive = rows.filtered(lambda event: not event.active and not event._caldav_preserves_local_event())
         if not inactive:
             return
@@ -1643,6 +1850,12 @@ class CalendarEvent(models.Model):
             rule_start = start.dt
             if not isinstance(rule_start, datetime):
                 rule_start = datetime.combine(rule_start, time.min)
+            # dateutil must receive a timezone with DST transitions; pytz's
+            # localized DTSTART tzinfo has a fixed offset when rrule iterates.
+            from dateutil.tz import gettz
+            zone_name = getattr(rule_start.tzinfo, "zone", None)
+            if zone_name:
+                rule_start = rule_start.astimezone(gettz(zone_name))
             rule = rrulestr(component["rrule"].to_ical().decode(), dtstart=rule_start)
         def dates(name):
             properties = component.get(name, [])
@@ -1655,9 +1868,22 @@ class CalendarEvent(models.Model):
             event_position = event.caldav_recurrence_id or event.start
             present = event_position == position or event_position in rdates
             if rule and event_position not in exdates:
-                candidate = event_position
                 if rule._dtstart.tzinfo:
-                    candidate = utc.localize(candidate).astimezone(rule._dtstart.tzinfo)
+                    candidate = utc.localize(event_position).astimezone(rule._dtstart.tzinfo)
+                    # _recompute_caldav_ids stores the initial UTC clock on
+                    # each occurrence date, including after DST. Reconstruct
+                    # that original wall-time position from the master's
+                    # initial offset, rather than trusting the current start
+                    # (which can itself use the legacy fixed UTC clock).
+                    first_utc = rule._dtstart.astimezone(utc).replace(tzinfo=None)
+                    legacy = rule._dtstart.replace(tzinfo=None) + (event_position - first_utc)
+                    legacy = legacy.replace(tzinfo=rule._dtstart.tzinfo)
+                    normalized = legacy.astimezone(utc).replace(tzinfo=None)
+                    if normalized in exdates:
+                        continue
+                    present = present or rule.before(legacy, inc=True) == legacy
+                else:
+                    candidate = event_position
                 present = present or rule.before(candidate, inc=True) == candidate
             if not (event.recurrency or event.recurrence_id):
                 # A standalone UID may move remotely; require a single row.
@@ -1668,7 +1894,7 @@ class CalendarEvent(models.Model):
             restored.with_context(
                 **CALDAV_IMPORT_CONTEXT, caldav_no_sync=True, caldav_keep_ids=True,
                 dont_notify=True, skip_attendee_notification=True,
-            ).write({"active": True, "recurrence_update": "self_only"})
+            ).write({"active": True})
             for chain in restored.recurrence_id:
                 active = chain.calendar_event_ids.filtered("active").sorted("start")
                 # Archiving the old base promotes the next occurrence. When
@@ -1708,8 +1934,8 @@ class CalendarEvent(models.Model):
         ]).encode()).hexdigest()
         state = None
         if not matched and component.get("recurrence-id"):
-            state = self._caldav_safety_state(user)
-            alias = state.get("positions", {}).get(alias_key)
+            state = self._caldav_import_safety_state(user)
+            alias = (state or {}).get("positions", {}).get(alias_key)
             if isinstance(alias, dict):
                 matched = detached.filtered(
                     lambda event: event.id == alias.get("id")
@@ -1737,12 +1963,12 @@ class CalendarEvent(models.Model):
                 # move again, while both incoming and legacy recurrence IDs
                 # must stay stable. Account/UID/positions are hashed; a local
                 # identity/position change invalidates this mapping.
-                state = state if state is not None else self._caldav_safety_state(user)
-                state.setdefault("positions", {})[alias_key] = {
-                    "id": matched.id,
-                    "stored": hashlib.sha256(str(matched.caldav_recurrence_id).encode()).hexdigest(),
-                }
-                self._caldav_save_safety_state(user, state)
+                if state is not None:
+                    state.setdefault("positions", {})[alias_key] = {
+                        "id": matched.id,
+                        "stored": hashlib.sha256(str(matched.caldav_recurrence_id).encode()).hexdigest(),
+                    }
+                    self._caldav_save_safety_state(user, state)
         if len(matched) > 1 or (not matched and component.get("recurrence-id")):
             raise ValueError("Ambiguous or unknown detached CalDAV recurrence position")
         if matched and not matched._caldav_preserves_local_event() and (

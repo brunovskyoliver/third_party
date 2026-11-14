@@ -136,7 +136,7 @@ class TestCalDAVDetachedSafety(TransactionCase, CaldavTestCommon):
                 outcome = self._poll(snapshot)
             self.assertIsInstance(outcome, Exception)
             self.assertEqual(len(events.exists().filtered("active")), 40)
-        notices = self.env["mail.activity"].sudo().search([("res_model", "=", "res.partner"), ("res_id", "=", self.user.partner_id.id), ("summary", "=", "CalDAV: zablokované odstraňovanie udalostí")])
+        notices = self.env["mail.activity"].sudo().search([("res_model", "=", "res.partner"), ("res_id", "=", self.user.partner_id.id), ("summary", "=", "CalDAV: vyžaduje kontrolu (snapshot)")])
         self.assertEqual(len(notices), 1)
 
     def test_five_deletions_in_small_calendar_are_allowed(self):

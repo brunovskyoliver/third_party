@@ -11,6 +11,7 @@ from caldav.elements import dav
 from odoo.tests import TransactionCase, tagged
 
 from .common import CaldavTestCommon
+from ..models.calendar_event import CalDAVPartialSyncError
 
 _logger = logging.getLogger("REVIEWB")
 LOGGER = "odoo.addons.caldav_sync.models.calendar_event"
@@ -228,13 +229,15 @@ class TestReviewBProbes(TransactionCase, CaldavTestCommon):
         resource = self._resource([master])  # unchanged remote, new digest not needed: token rotates
         master2 = self._component("mixed-series", start=datetime(2030, 3, 4, 9), title="Renamed remotely")
         master2.add("rrule", {"freq": "weekly", "count": 4})
-        outcome = self._poll(ordinary + [self._resource([master2])])
+        with self.assertLogs(LOGGER, "WARNING") as logs:
+            outcome = self._poll(ordinary + [self._resource([master2])])
         linked = (chain - stray).exists()
         _logger.warning("REVIEWB P8 outcome=%r linked active=%s/3 names=%s stray active=%s",
                         outcome, len(linked.filtered("active")), linked.mapped("name"), stray.exists().active if stray.exists() else "deleted")
         self.assertEqual(len(linked.filtered("active")), 3)
         # Combined owner direction requires mixed UIDs to fail closed, so the
         # remote rename is intentionally not applied to any row in this resource.
-        self.assertIsInstance(outcome, Exception)
+        self.assertIsInstance(outcome, CalDAVPartialSyncError)
+        self.assertTrue(any("mixed" in line.lower() for line in logs.output))
         self.assertEqual(set(linked.mapped("name")), {"Synthetic meeting"})
         self.assertTrue(stray.active)

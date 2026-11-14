@@ -15,3 +15,7 @@ from . import test_rework_safety
 from . import test_review_b_probes
 
 from . import test_live_delta
+
+from . import test_review_a2
+
+from . import test_review_b2_probes
