@@ -25,3 +25,5 @@ from . import test_review_a3
 from . import test_round4_safety
 
 from . import test_review_b3_probes
+
+from . import test_booking_attendees

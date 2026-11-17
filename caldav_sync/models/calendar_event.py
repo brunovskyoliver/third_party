@@ -796,11 +796,28 @@ class CalendarEvent(models.Model):
             rrule_dict = _parse_rrule_string(rrule)
             event_data["rrule"] = vRecur(**rrule_dict)
 
+    def _caldav_booking_client_partners(self):
+        """Attendees of an appointment booking who are not internal users.
+
+        A booking's client stays an Odoo attendee (their change and cancel
+        links depend on it) but is never sent to the CalDAV server. The
+        ``appointment`` module is optional for this addon.
+        """
+        self.ensure_one()
+        if "appointment_type_id" not in self._fields or not self.appointment_type_id:
+            return self.env["res.partner"]
+        return self.partner_ids.filtered(
+            lambda partner: not any(
+                not user.share
+                for user in partner.sudo().with_context(active_test=False).user_ids
+            )
+        )
+
     def _add_event_attendees(self, event_data: Dict) -> None:
         """Add the attendee information to the "organizer" and "attendee"
         keys of the event data."""
         attendee_lines = []
-        for partner in self.partner_ids:
+        for partner in self.partner_ids - self._caldav_booking_client_partners():
             if partner == self.user_id.partner_id:
                 continue
             attendee = vCalAddress(f"MAILTO:{partner.email}")
@@ -2294,6 +2311,15 @@ class CalendarEvent(models.Model):
         # Don't update partner_ids if no change
         if "partner_ids" in values:
             partner_ids = values["partner_ids"][0][2]  # this is a SET command
+            # Booking clients are left out of the outgoing attendee list, so the
+            # server never returns them; their absence is not a removal.
+            kept = [
+                id for id in self._caldav_booking_client_partners().ids
+                if id not in partner_ids
+            ]
+            if kept:
+                partner_ids = list(partner_ids) + kept
+                values["partner_ids"] = [(6, 0, partner_ids)]
             added_partner_ids = set(
                 [id for id in partner_ids if id not in self.partner_ids.ids]
             )
