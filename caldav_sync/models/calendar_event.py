@@ -755,7 +755,12 @@ class CalendarEvent(models.Model):
         if self.name:
             event_data["summary"] = vText(self.name)
         # TODO: Consider using X-ALT-DESC to stick HTML into the iCal event desc.
-        if self.description and self._html_to_text(self.description):
+        # A booking's description (the reception note) stays in Odoo, as with Outlook.
+        if (
+            not self._caldav_is_appointment_booking()
+            and self.description
+            and self._html_to_text(self.description)
+        ):
             event_data["description"] = vText(self._html_to_text(self.description))
         if self.location:
             event_data["location"] = vText(self.location)
@@ -796,6 +801,11 @@ class CalendarEvent(models.Model):
             rrule_dict = _parse_rrule_string(rrule)
             event_data["rrule"] = vRecur(**rrule_dict)
 
+    def _caldav_is_appointment_booking(self):
+        """True for an appointment booking. ``appointment`` is optional for this addon."""
+        self.ensure_one()
+        return "appointment_type_id" in self._fields and bool(self.appointment_type_id)
+
     def _caldav_booking_client_partners(self):
         """Attendees of an appointment booking who are not internal users.
 
@@ -804,7 +814,7 @@ class CalendarEvent(models.Model):
         ``appointment`` module is optional for this addon.
         """
         self.ensure_one()
-        if "appointment_type_id" not in self._fields or not self.appointment_type_id:
+        if not self._caldav_is_appointment_booking():
             return self.env["res.partner"]
         return self.partner_ids.filtered(
             lambda partner: not any(
@@ -2330,6 +2340,11 @@ class CalendarEvent(models.Model):
                 values.pop("partner_ids")  # They break the equality check later
             else:
                 changed_vals["partner_ids"] = values["partner_ids"]
+
+        # A booking's description is never sent, so the server's (empty) one is
+        # not a change: the note kept in Odoo must survive the next poll.
+        if "description" in values and self._caldav_is_appointment_booking():
+            values.pop("description")
 
         # Get just the list of values that have changed, leave the others alone
         for key, val in values.items():
