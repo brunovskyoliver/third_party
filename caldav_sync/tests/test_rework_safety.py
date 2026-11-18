@@ -247,7 +247,7 @@ class TestCalDAVReworkSafety(TransactionCase):
         with self.assertLogs(LOGGER, "WARNING"):
             self._poll(resources[:-25])
         self.events._caldav_approve_cleanup(self.user)
-        events[-1].with_context(caldav_no_sync=True, no_microsoft_sync=True).write({"name": "Locally edited pending row"})
+        events.sorted("id")[-1].with_context(caldav_no_sync=True, no_microsoft_sync=True).write({"name": "Locally edited pending row"})
         with self.assertLogs(LOGGER, "WARNING"):
             self.assertIsInstance(self._poll(resources[:-25]), CalDAVPartialSyncError)
         self.assertEqual(len(events.filtered("active")), 60)
